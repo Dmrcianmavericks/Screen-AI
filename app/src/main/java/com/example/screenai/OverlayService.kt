@@ -26,18 +26,11 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
 class OverlayService : Service() {
-
-    data class WorkingEndpoint(
-        val key: String,
-        val baseUrl: String, // Either AI Studio or Vertex Express
-        val model: String
-    )
 
     private lateinit var windowManager: WindowManager
     private lateinit var overlayView: LinearLayout
@@ -48,29 +41,14 @@ class OverlayService : Service() {
     private val bitmapLock = Object()
     private var latestBitmap: Bitmap? = null
 
-    private var rawKeyList: List<String> = emptyList()
-    // Holds only pre-tested, 100% verified working (Key + Endpoint + Model) routes
-    private val verifiedRoutes = CopyOnWriteArrayList<WorkingEndpoint>()
-    private val routeCounter = AtomicInteger(0)
-    private val cooldownUntil = ConcurrentHashMap<String, Long>()
+    private var apiKeys: List<String> = emptyList()
+    private val turnCounter = AtomicInteger(0)
+    private val keyCooldownUntil = ConcurrentHashMap<String, Long>()
+    private val geminiModelCache = ConcurrentHashMap<String, String>()
 
     private var isScanning = false
     private lateinit var bgThread: HandlerThread
     private lateinit var bgHandler: Handler
-
-    companion object {
-        private const val AI_STUDIO_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-        private const val VERTEX_BASE = "https://aiplatform.googleapis.com/v1/publishers/google/models"
-
-        // Verified 2026 fast multimodal Flash models
-        private val CANDIDATE_MODELS = listOf(
-            "gemini-2.5-flash",
-            "gemini-3.6-flash",
-            "gemini-3.8-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-3.5-flash-lite"
-        )
-    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -91,7 +69,7 @@ class OverlayService : Service() {
         }
 
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
-        rawKeyList = rawKeys.split(",", "\n", " ")
+        apiKeys = rawKeys.split(",", "\n", " ")
             .map { it.trim() }
             .filter { it.length > 12 }
             .distinct()
@@ -111,8 +89,14 @@ class OverlayService : Service() {
         setupScreenReader()
         setupFloatingOverlay()
 
-        // Probe all 4 keys in parallel right on startup so scanning has ZERO guesswork
-        warmUpAndVerifyAllKeys()
+        // Pre-check which exact Gemini model is unlocked for any AQ. or AIza key on startup
+        thread {
+            for (k in apiKeys) {
+                if (!k.startsWith("gsk_")) {
+                    discoverGeminiModel(k)?.let { geminiModelCache[k] = it }
+                }
+            }
+        }
 
         return START_NOT_STICKY
     }
@@ -126,7 +110,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Tap SCAN on overlay")
+                .setContentText("${apiKeys.size} Keys Loaded")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -143,7 +127,7 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        // 62% resolution keeps math symbols (+, -, ÷, exponents) sharp and uploads in 0.2s
+        // 62% resolution keeps math symbols (+, -, ÷, fractions) crisp and uploads in ~0.2s on 4G
         val width = (metrics.widthPixels * 0.62).toInt()
         val height = (metrics.heightPixels * 0.62).toInt()
         val density = metrics.densityDpi
@@ -220,12 +204,12 @@ class OverlayService : Service() {
             textSize = 11f
             setPadding(16, 4, 16, 4)
             setOnClickListener {
-                if (!isScanning) captureAndAskGemini()
+                if (!isScanning) captureAndAskAI()
             }
         }
 
         answerText = TextView(this).apply {
-            text = "Checking keys..."
+            text = "Ready (${apiKeys.size} keys)"
             setTextColor(Color.parseColor("#00FF88"))
             textSize = 14f
             setPadding(20, 0, 20, 0)
@@ -277,68 +261,11 @@ class OverlayService : Service() {
         windowManager.addView(overlayView, params)
     }
 
-    // Runs in parallel when overlay opens: tests each key against the right endpoint (Vertex for AQ., AI Studio for AIza)
-    private fun warmUpAndVerifyAllKeys() {
-        for (key in rawKeyList) {
-            thread {
-                val route = findWorkingRouteForKey(key)
-                if (route != null) {
-                    verifiedRoutes.add(route)
-                    Handler(Looper.getMainLooper()).post {
-                        if (!isScanning) {
-                            answerText.text = "Ready (${verifiedRoutes.size} active)"
-                        }
-                    }
-                }
-            }
+    private fun captureAndAskAI() {
+        if (apiKeys.isEmpty()) {
+            answerText.text = "Add Key in App!"
+            return
         }
-    }
-
-    private fun findWorkingRouteForKey(key: String): WorkingEndpoint? {
-        // AQ. keys belong to Vertex Express first; AIzaSy keys belong to AI Studio first
-        val baseUrls = if (key.startsWith("AQ.")) {
-            listOf(VERTEX_BASE, AI_STUDIO_BASE)
-        } else {
-            listOf(AI_STUDIO_BASE, VERTEX_BASE)
-        }
-
-        for (base in baseUrls) {
-            for (model in CANDIDATE_MODELS) {
-                val status = testPing(key, base, model)
-                if (status == 200 || status == 429) {
-                    // 200 or 429 means this (Key + Endpoint + Model) is 100% valid and authenticated!
-                    return WorkingEndpoint(key, base, model)
-                }
-            }
-        }
-        return null
-    }
-
-    private fun testPing(key: String, baseUrl: String, model: String): Int {
-        var conn: HttpURLConnection? = null
-        return try {
-            val encodedKey = URLEncoder.encode(key, "UTF-8")
-            val url = URL("$baseUrl/$model:generateContent?key=$encodedKey")
-            conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("x-goog-api-key", key)
-                connectTimeout = 3000
-                readTimeout = 3000
-                doOutput = true
-            }
-            // Minimal 1-token ping with "role": "user" (required by Vertex!)
-            val payload = """{"contents":[{"role":"user","parts":[{"text":"1"}]}],"generationConfig":{"maxOutputTokens":2}}"""
-            conn.outputStream.use { it.write(payload.toByteArray()) }
-            conn.responseCode
-        } catch (e: Exception) {
-            0
-        } finally {
-            conn?.disconnect()
-        }
-    }
-
-    private fun captureAndAskGemini() {
         isScanning = true
         answerText.text = "..."
         overlayView.visibility = View.INVISIBLE
@@ -359,13 +286,13 @@ class OverlayService : Service() {
             thread {
                 val base64Img = bitmapToBase64(snap)
                 snap.recycle()
-                val reply = executeFastScan(base64Img)
+                val reply = executeMultiKeyScan(base64Img)
                 Handler(Looper.getMainLooper()).post {
                     answerText.text = reply
                     isScanning = false
                 }
             }
-        }, 45)
+        }, 40)
     }
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
@@ -374,71 +301,201 @@ class OverlayService : Service() {
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
-    private fun executeFastScan(base64Image: String): String {
-        // If user tapped Scan within 1 second before warm-up finished, build default routes immediately
-        if (verifiedRoutes.isEmpty()) {
-            for (k in rawKeyList) {
-                val defaultBase = if (k.startsWith("AQ.")) VERTEX_BASE else AI_STUDIO_BASE
-                val defaultModel = if (k.startsWith("AQ.")) "gemini-2.5-flash" else "gemini-2.5-flash"
-                verifiedRoutes.add(WorkingEndpoint(k, defaultBase, defaultModel))
-            }
-        }
-
-        val total = verifiedRoutes.size
-        if (total == 0) return "No valid key"
-
-        val startIdx = routeCounter.getAndIncrement()
+    private fun executeMultiKeyScan(base64Image: String): String {
+        val total = apiKeys.size
+        val startIdx = turnCounter.getAndIncrement()
         val now = System.currentTimeMillis()
-        var lastErr = "Retry"
+        var lastError = "Retry"
 
-        // Pass 1: Try verified routes that are NOT on a 429 cooldown
+        // Pass 1: Try active keys not in cooldown
         for (i in 0 until total) {
-            val route = verifiedRoutes[(startIdx + i) % total]
-            val id = "${route.key}|${route.model}"
-            if (now < (cooldownUntil[id] ?: 0L)) continue
+            val key = apiKeys[(startIdx + i) % total]
+            if (now < (keyCooldownUntil[key] ?: 0L)) continue
 
-            val res = callEndpointFast(route, base64Image)
+            val res = if (key.startsWith("gsk_")) {
+                callGroqFast(key, base64Image)
+            } else {
+                callGeminiSmart(key, base64Image)
+            }
+
             if (!res.startsWith("ERR:")) {
                 return res
             }
-            lastErr = res.removePrefix("ERR:")
-            if (lastErr == "429") {
-                // Cool down this key for 30s and immediately use the next key in 0.01s
-                cooldownUntil[id] = System.currentTimeMillis() + 30_000L
+
+            lastError = res.removePrefix("ERR:")
+            if (lastError == "429") {
+                // Cool down this key for 20s and immediately jump to the next key
+                keyCooldownUntil[key] = System.currentTimeMillis() + 20_000L
+            } else if (lastError == "403" || lastError == "401") {
+                // Key is invalid or leaked, skip it for 5 minutes
+                keyCooldownUntil[key] = System.currentTimeMillis() + 300_000L
             }
         }
 
-        // Pass 2: If all keys had a cooldown, try an alternate model on each key (separate quota bucket!)
-        for (i in 0 until total) {
-            val route = verifiedRoutes[(startIdx + i) % total]
-            val altModel = if (route.model == "gemini-2.5-flash") "gemini-2.5-flash-lite" else "gemini-2.5-flash"
-            val altRoute = WorkingEndpoint(route.key, route.baseUrl, altModel)
-            val res = callEndpointFast(altRoute, base64Image)
-            if (!res.startsWith("ERR:")) {
-                return res
+        // Pass 2: If all keys had a brief 429 cooldown, force-try the next key in line anyway
+        val fallbackKey = apiKeys[startIdx % total]
+        val forceRes = if (fallbackKey.startsWith("gsk_")) {
+            callGroqFast(fallbackKey, base64Image)
+        } else {
+            callGeminiSmart(fallbackKey, base64Image)
+        }
+        if (!forceRes.startsWith("ERR:")) return forceRes
+
+        return "Err ($lastError)"
+    }
+
+    // GROQ ENGINE: Uses Llama 4 Maverick (400B flagship for better math) -> fallback to Llama 4 Scout
+    private fun callGroqFast(groqKey: String, base64Image: String): String {
+        val models = listOf(
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "meta-llama/llama-4-scout-17b-16e-instruct"
+        )
+        var lastCode = "Net"
+        for (model in models) {
+            var conn: HttpURLConnection? = null
+            try {
+                val url = URL("https://api.groq.com/openai/v1/chat/completions")
+                conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    setRequestProperty("Authorization", "Bearer $groqKey")
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Connection", "keep-alive")
+                    connectTimeout = 3500
+                    readTimeout = 3500
+                    doOutput = true
+                }
+
+                val prompt = "Solve the math or quiz question on screen carefully. Reply ONLY with the correct option letter and final answer (example: 'B) precise' or 'C) 24'). Maximum 4 words. No explanation."
+
+                val contentArr = JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("type", "text")
+                        put("text", prompt)
+                    })
+                    put(JSONObject().apply {
+                        put("type", "image_url")
+                        put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$base64Image"))
+                    })
+                }
+
+                val messages = JSONArray().put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", contentArr)
+                })
+
+                val payload = JSONObject().apply {
+                    put("model", model)
+                    put("messages", messages)
+                    put("temperature", 0.0)
+                    put("max_tokens", 35)
+                }
+
+                conn.outputStream.use { it.write(payload.toString().toByteArray()) }
+
+                val code = conn.responseCode
+                if (code == 200) {
+                    val res = JSONObject(conn.inputStream.bufferedReader().readText())
+                    val text = res.getJSONArray("choices")
+                        .getJSONObject(0)
+                        .getJSONObject("message")
+                        .getString("content")
+                        .trim()
+                        .replace("\n", " ")
+                        .replace("*", "")
+                    if (text.isNotEmpty()) return text
+                } else {
+                    lastCode = "$code"
+                    if (code == 401 || code == 403 || code == 429) break
+                }
+            } catch (e: Exception) {
+                lastCode = "Time"
+            } finally {
+                conn?.disconnect()
             }
         }
-
-        return "Wait 10s ($lastErr)"
+        return "ERR:$lastCode"
     }
 
-    private fun callEndpointFast(route: WorkingEndpoint, base64Image: String): String {
-        var res = sendHttpRequest(route, base64Image, includeThinkingConfig = true)
-        if (res == "ERR:400") {
-            res = sendHttpRequest(route, base64Image, includeThinkingConfig = false)
-        }
-        return res
-    }
-
-    private fun sendHttpRequest(route: WorkingEndpoint, base64Image: String, includeThinkingConfig: Boolean): String {
+    // GEMINI ENGINE: Discovers the exact unlocked October 2026 Flash model for AQ. or AIza keys
+    private fun discoverGeminiModel(key: String): String? {
         var conn: HttpURLConnection? = null
         return try {
-            val encodedKey = URLEncoder.encode(route.key, "UTF-8")
-            val url = URL("${route.baseUrl}/${route.model}:generateContent?key=$encodedKey")
+            val encodedKey = URLEncoder.encode(key, "UTF-8")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$encodedKey")
+            conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                setRequestProperty("x-goog-api-key", key)
+                connectTimeout = 3000
+                readTimeout = 3000
+            }
+            if (conn.responseCode != 200) return null
+
+            val json = JSONObject(conn.inputStream.bufferedReader().readText())
+            val arr = json.getJSONArray("models")
+            val unlocked = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val m = arr.getJSONObject(i)
+                val name = m.getString("name").removePrefix("models/")
+                val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
+                if (methods.contains("generateContent")) unlocked.add(name)
+            }
+
+            // Current October 2026 AI Studio active models
+            val preferred = listOf(
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-3.5-flash-lite",
+                "gemini-2.5-flash",
+                "gemini-3.1-flash-lite"
+            )
+            for (p in preferred) {
+                if (unlocked.contains(p)) return p
+            }
+            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+        } catch (e: Exception) {
+            null
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    private fun callGeminiSmart(key: String, base64Image: String): String {
+        val cached = geminiModelCache[key] ?: discoverGeminiModel(key)?.also { geminiModelCache[key] = it }
+        // Tries discovered model first, then 3.6-flash, 3.5-flash-lite, and 3.8-flash
+        val modelsToTry = listOfNotNull(
+            cached,
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-2.5-flash"
+        ).distinct()
+
+        var lastCode = "Net"
+        for (model in modelsToTry) {
+            var res = sendGeminiHttp(key, model, base64Image, useThinkingConfig = true)
+            if (res == "ERR:400") {
+                res = sendGeminiHttp(key, model, base64Image, useThinkingConfig = false)
+            }
+            if (!res.startsWith("ERR:")) {
+                geminiModelCache[key] = model
+                return res
+            }
+            lastCode = res.removePrefix("ERR:")
+            // If key itself is rate-limited (429) or blocked (403), stop trying models on this key and switch to next key!
+            if (lastCode == "429" || lastCode == "403") break
+        }
+        return "ERR:$lastCode"
+    }
+
+    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, useThinkingConfig: Boolean): String {
+        var conn: HttpURLConnection? = null
+        return try {
+            val encodedKey = URLEncoder.encode(key, "UTF-8")
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$encodedKey")
             conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("x-goog-api-key", route.key)
+                setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
                 connectTimeout = 3500
                 readTimeout = 3500
@@ -455,18 +512,12 @@ class OverlayService : Service() {
                 put(JSONObject().put("text", prompt))
                 put(JSONObject().put("inlineData", inlineData))
             }
+            val contents = JSONArray().put(JSONObject().put("parts", parts))
 
-            // CRITICAL: "role": "user" is mandatory for AQ. Vertex Express keys!
-            val userContent = JSONObject().apply {
-                put("role", "user")
-                put("parts", parts)
-            }
-            val contents = JSONArray().put(userContent)
-
+            // Note: 'temperature' is omitted because Gemini 3.6/3.8 deprecated sampling parameters
             val genConfig = JSONObject().apply {
-                put("temperature", 0.0)
-                put("maxOutputTokens", 60)
-                if (includeThinkingConfig) {
+                put("maxOutputTokens", 80)
+                if (useThinkingConfig) {
                     put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                 }
             }
