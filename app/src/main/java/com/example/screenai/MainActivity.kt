@@ -21,12 +21,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var keyInput4: EditText
     private lateinit var projectionManager: MediaProjectionManager
 
-    // Your 4 exact keys pre-loaded as defaults
-    private val defaultKey1 = "AIzaSyDhqzh0eUNaB__ZASLqLGOCyZllOApgt5c"
-    private val defaultKey2 = "AQ.Ab8RN6KFMF8d5RSRL8nhUxHoKW0x1peVjzcK9EKXvm_UHnu6Fw"
-    private val defaultKey3 = "AQ.Ab8RN6JlOf5UBbxOy0qWFy8mhN1tIC7he5M-Bi15rf18s4-0XA"
-    private val defaultKey4 = "AQ.Ab8RN6IJ29Ou1fXy1sfWRFMVXXdwQJGISvauvOnNWGfztlBb4g"
-
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -36,7 +30,7 @@ class MainActivity : AppCompatActivity() {
                 keyInput2.text.toString().trim(),
                 keyInput3.text.toString().trim(),
                 keyInput4.text.toString().trim()
-            ).filter { it.length > 10 }.joinToString(",")
+            ).filter { it.length > 12 }.joinToString(",")
 
             val serviceIntent = Intent(this, OverlayService::class.java).apply {
                 putExtra("RESULT_CODE", result.resultCode)
@@ -66,33 +60,28 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(60, 220, 60, 80)
+            setPadding(60, 200, 60, 80)
             setBackgroundColor(Color.WHITE)
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (4-Key Dual Engine)"
+            text = "ScreenAI (Gemini + Groq Engine)"
             textSize = 20f
             setTextColor(Color.BLACK)
-            setPadding(0, 0, 0, 16)
+            setPadding(0, 0, 0, 14)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Supports both AIzaSy (AI Studio) and AQ. (Vertex Express) keys automatically."
+            text = "Supports Gemini (AQ. / AIza) AND Groq (gsk_) keys in any box! Mix or match up to 4 keys. Never paste keys on GitHub."
             textSize = 13f
             setTextColor(Color.DKGRAY)
-            setPadding(0, 0, 0, 30)
+            setPadding(0, 0, 0, 28)
         }
 
-        val saved1 = prefs.getString("KEY_1", "").takeIf { !it.isNullOrBlank() } ?: defaultKey1
-        val saved2 = prefs.getString("KEY_2", "").takeIf { !it.isNullOrBlank() } ?: defaultKey2
-        val saved3 = prefs.getString("KEY_3", "").takeIf { !it.isNullOrBlank() } ?: defaultKey3
-        val saved4 = prefs.getString("KEY_4", "").takeIf { !it.isNullOrBlank() } ?: defaultKey4
-
-        keyInput1 = createKeyBox("Key 1 (AIza or AQ.)", saved1)
-        keyInput2 = createKeyBox("Key 2 (AIza or AQ.)", saved2)
-        keyInput3 = createKeyBox("Key 3 (AIza or AQ.)", saved3)
-        keyInput4 = createKeyBox("Key 4 (AIza or AQ.)", saved4)
+        keyInput1 = createKeyBox("Key 1 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_1", "") ?: "")
+        keyInput2 = createKeyBox("Key 2 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_2", "") ?: "")
+        keyInput3 = createKeyBox("Key 3 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_3", "") ?: "")
+        keyInput4 = createKeyBox("Key 4 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_4", "") ?: "")
 
         val startBtn = Button(this).apply {
             text = "Start AI Overlay"
@@ -103,15 +92,15 @@ class MainActivity : AppCompatActivity() {
                 val k4 = keyInput4.text.toString().trim()
 
                 if (k1.isEmpty() && k2.isEmpty() && k3.isEmpty() && k4.isEmpty()) {
-                    Toast.makeText(context, "Enter at least 1 key!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Paste at least 1 API key!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
                 prefs.edit()
-                    .putString("KEY_1", k1)
-                    .putString("KEY_2", k2)
-                    .putString("KEY_3", k3)
-                    .putString("KEY_4", k4)
+                    .putString("SAFE_KEY_1", k1)
+                    .putString("SAFE_KEY_2", k2)
+                    .putString("SAFE_KEY_3", k3)
+                    .putString("SAFE_KEY_4", k4)
                     .apply()
 
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
@@ -124,6 +113,18 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
                 }
+            }
+        }
+
+        val clearBtn = Button(this).apply {
+            text = "Clear All Keys"
+            setOnClickListener {
+                keyInput1.setText("")
+                keyInput2.setText("")
+                keyInput3.setText("")
+                keyInput4.setText("")
+                prefs.edit().clear().apply()
+                Toast.makeText(context, "All keys cleared", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -142,6 +143,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(keyInput3)
         layout.addView(keyInput4)
         layout.addView(startBtn)
+        layout.addView(clearBtn)
         layout.addView(stopBtn)
         scrollView.addView(layout)
         setContentView(scrollView)
