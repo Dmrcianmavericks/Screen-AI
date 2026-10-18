@@ -21,6 +21,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var keyInput4: EditText
     private lateinit var projectionManager: MediaProjectionManager
 
+    // Your 4 exact keys pre-loaded as defaults
+    private val defaultKey1 = "AIzaSyDhqzh0eUNaB__ZASLqLGOCyZllOApgt5c"
+    private val defaultKey2 = "AQ.Ab8RN6KFMF8d5RSRL8nhUxHoKW0x1peVjzcK9EKXvm_UHnu6Fw"
+    private val defaultKey3 = "AQ.Ab8RN6JlOf5UBbxOy0qWFy8mhN1tIC7he5M-Bi15rf18s4-0XA"
+    private val defaultKey4 = "AQ.Ab8RN6IJ29Ou1fXy1sfWRFMVXXdwQJGISvauvOnNWGfztlBb4g"
+
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -65,29 +71,28 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (4-Key Turbo Setup)"
+            text = "ScreenAI (4-Key Dual Engine)"
             textSize = 20f
             setTextColor(Color.BLACK)
             setPadding(0, 0, 0, 16)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Paste 1 to 4 Gemini API keys from different Gmail accounts below. The app automatically rotates them so you never hit a 429 limit."
+            text = "Supports both AIzaSy (AI Studio) and AQ. (Vertex Express) keys automatically."
             textSize = 13f
             setTextColor(Color.DKGRAY)
             setPadding(0, 0, 0, 30)
         }
 
-        keyInput1 = createKeyBox("Gemini API Key 1 (Required)", prefs.getString("KEY_1", "") ?: "")
-        keyInput2 = createKeyBox("Gemini API Key 2 (Optional - Gmail 2)", prefs.getString("KEY_2", "") ?: "")
-        keyInput3 = createKeyBox("Gemini API Key 3 (Optional - Gmail 3)", prefs.getString("KEY_3", "") ?: "")
-        keyInput4 = createKeyBox("Gemini API Key 4 (Optional - Gmail 4)", prefs.getString("KEY_4", "") ?: "")
+        val saved1 = prefs.getString("KEY_1", "").takeIf { !it.isNullOrBlank() } ?: defaultKey1
+        val saved2 = prefs.getString("KEY_2", "").takeIf { !it.isNullOrBlank() } ?: defaultKey2
+        val saved3 = prefs.getString("KEY_3", "").takeIf { !it.isNullOrBlank() } ?: defaultKey3
+        val saved4 = prefs.getString("KEY_4", "").takeIf { !it.isNullOrBlank() } ?: defaultKey4
 
-        // Migrate old single key if present
-        if (keyInput1.text.isEmpty()) {
-            val oldKey = prefs.getString("API_KEY", "") ?: ""
-            if (oldKey.isNotEmpty()) keyInput1.setText(oldKey)
-        }
+        keyInput1 = createKeyBox("Key 1 (AIza or AQ.)", saved1)
+        keyInput2 = createKeyBox("Key 2 (AIza or AQ.)", saved2)
+        keyInput3 = createKeyBox("Key 3 (AIza or AQ.)", saved3)
+        keyInput4 = createKeyBox("Key 4 (AIza or AQ.)", saved4)
 
         val startBtn = Button(this).apply {
             text = "Start AI Overlay"
@@ -98,7 +103,7 @@ class MainActivity : AppCompatActivity() {
                 val k4 = keyInput4.text.toString().trim()
 
                 if (k1.isEmpty() && k2.isEmpty() && k3.isEmpty() && k4.isEmpty()) {
-                    Toast.makeText(context, "Paste at least 1 Gemini API Key!", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Enter at least 1 key!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
