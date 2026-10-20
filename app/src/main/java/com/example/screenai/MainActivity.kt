@@ -15,27 +15,27 @@ import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var keyInput1: EditText
-    private lateinit var keyInput2: EditText
-    private lateinit var keyInput3: EditText
-    private lateinit var keyInput4: EditText
+    private val keyInputs = mutableListOf<EditText>()
+    private lateinit var opacitySeekBar: SeekBar
+    private lateinit var opacityLabel: TextView
     private lateinit var projectionManager: MediaProjectionManager
 
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            val combinedKeys = listOf(
-                keyInput1.text.toString().trim(),
-                keyInput2.text.toString().trim(),
-                keyInput3.text.toString().trim(),
-                keyInput4.text.toString().trim()
-            ).filter { it.length > 12 }.joinToString(",")
+            val combinedKeys = keyInputs
+                .map { it.text.toString().trim() }
+                .filter { it.length > 12 }
+                .joinToString(",")
+
+            val chosenOpacity = opacitySeekBar.progress
 
             val serviceIntent = Intent(this, OverlayService::class.java).apply {
                 putExtra("RESULT_CODE", result.resultCode)
                 putExtra("DATA", result.data)
                 putExtra("API_KEY", combinedKeys)
+                putExtra("OPACITY_PERCENT", chosenOpacity)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
@@ -60,48 +60,77 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(60, 200, 60, 80)
+            setPadding(60, 160, 60, 80)
             setBackgroundColor(Color.WHITE)
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (Gemini + Groq Engine)"
+            text = "ScreenAI (3-Key Majority Vote)"
             textSize = 20f
             setTextColor(Color.BLACK)
-            setPadding(0, 0, 0, 14)
+            setPadding(0, 0, 0, 12)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Supports Gemini (AQ. / AIza) AND Groq (gsk_) keys in any box! Mix or match up to 4 keys. Never paste keys on GitHub."
+            text = "Paste 3 to 8 keys below. Fires 3 keys simultaneously on every scan and picks the 2-out-of-3 majority answer in ~1.2s!"
             textSize = 13f
             setTextColor(Color.DKGRAY)
-            setPadding(0, 0, 0, 28)
+            setPadding(0, 0, 0, 24)
         }
 
-        keyInput1 = createKeyBox("Key 1 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_1", "") ?: "")
-        keyInput2 = createKeyBox("Key 2 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_2", "") ?: "")
-        keyInput3 = createKeyBox("Key 3 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_3", "") ?: "")
-        keyInput4 = createKeyBox("Key 4 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_4", "") ?: "")
+        layout.addView(title)
+        layout.addView(subtitle)
+
+        // Smooth 0% - 100% Opacity Slider
+        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 65)
+
+        opacityLabel = TextView(this).apply {
+            text = "Stealth Overlay Opacity: $savedOpacity%"
+            textSize = 15f
+            setTextColor(Color.BLACK)
+            setPadding(0, 10, 0, 8)
+        }
+
+        opacitySeekBar = SeekBar(this).apply {
+            max = 100
+            progress = savedOpacity
+            setPadding(10, 10, 10, 28)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    opacityLabel.text = "Stealth Overlay Opacity: $progress%"
+                }
+                override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+                override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+            })
+        }
+
+        layout.addView(opacityLabel)
+        layout.addView(opacitySeekBar)
+
+        // 8 Key Input Boxes (compatible with your existing SAFE_KEY_1..4 + new SAFE_KEY_5..8)
+        keyInputs.clear()
+        for (i in 1..8) {
+            val savedKey = prefs.getString("SAFE_KEY_$i", "") ?: ""
+            val box = createKeyBox("Key $i (AQ. / AIza)", savedKey)
+            keyInputs.add(box)
+            layout.addView(box)
+        }
 
         val startBtn = Button(this).apply {
             text = "Start AI Overlay"
             setOnClickListener {
-                val k1 = keyInput1.text.toString().trim()
-                val k2 = keyInput2.text.toString().trim()
-                val k3 = keyInput3.text.toString().trim()
-                val k4 = keyInput4.text.toString().trim()
-
-                if (k1.isEmpty() && k2.isEmpty() && k3.isEmpty() && k4.isEmpty()) {
+                val activeKeys = keyInputs.map { it.text.toString().trim() }.filter { it.isNotEmpty() }
+                if (activeKeys.isEmpty()) {
                     Toast.makeText(context, "Paste at least 1 API key!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
-                prefs.edit()
-                    .putString("SAFE_KEY_1", k1)
-                    .putString("SAFE_KEY_2", k2)
-                    .putString("SAFE_KEY_3", k3)
-                    .putString("SAFE_KEY_4", k4)
-                    .apply()
+                val editor = prefs.edit()
+                for (i in 1..8) {
+                    editor.putString("SAFE_KEY_$i", keyInputs[i - 1].text.toString().trim())
+                }
+                editor.putInt("OVERLAY_OPACITY", opacitySeekBar.progress)
+                editor.apply()
 
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     val intent = Intent(
@@ -119,10 +148,7 @@ class MainActivity : AppCompatActivity() {
         val clearBtn = Button(this).apply {
             text = "Clear All Keys"
             setOnClickListener {
-                keyInput1.setText("")
-                keyInput2.setText("")
-                keyInput3.setText("")
-                keyInput4.setText("")
+                for (box in keyInputs) box.setText("")
                 prefs.edit().clear().apply()
                 Toast.makeText(context, "All keys cleared", Toast.LENGTH_SHORT).show()
             }
@@ -136,12 +162,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        layout.addView(title)
-        layout.addView(subtitle)
-        layout.addView(keyInput1)
-        layout.addView(keyInput2)
-        layout.addView(keyInput3)
-        layout.addView(keyInput4)
         layout.addView(startBtn)
         layout.addView(clearBtn)
         layout.addView(stopBtn)
@@ -156,7 +176,7 @@ class MainActivity : AppCompatActivity() {
             setHintTextColor(Color.GRAY)
             setText(savedVal)
             setSingleLine(true)
-            setPadding(24, 28, 24, 28)
+            setPadding(24, 22, 24, 22)
         }
     }
 }
