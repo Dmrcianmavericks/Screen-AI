@@ -54,6 +54,7 @@ class OverlayService : Service() {
     private val pairStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
     private val keyCooldownUntil = ConcurrentHashMap<String, Long>()
+    private val legacyThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     private val noThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     private var networkPool: ExecutorService = Executors.newCachedThreadPool()
@@ -132,7 +133,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Trick-Solver Fast Mode Active")
+                .setContentText("Smart Reasoning Mode Active")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -149,9 +150,9 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        // Single-pass 0.56 scale keeps math symbols, exponents, and '___' blanks crisp without double-scaling blur
-        val width = (metrics.widthPixels * 0.56).toInt()
-        val height = (metrics.heightPixels * 0.56).toInt()
+        // 0.60 scale keeps fill-in-the-blank lines, math signs, and text sharp
+        val width = (metrics.widthPixels * 0.60).toInt()
+        val height = (metrics.heightPixels * 0.60).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -338,7 +339,7 @@ class OverlayService : Service() {
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, outputStream)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 62, outputStream)
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -446,14 +447,16 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
-            // Strictly prefers full Flash models over -lite models so trick questions aren't missed
+            // Prioritizes the smartest full Flash models first so trick questions are solved accurately
             val preferred = listOf(
-                "gemini-2.5-flash",
-                "gemini-3.6-flash",
                 "gemini-3.8-flash",
+                "gemini-3.7-flash",
+                "gemini-3.6-flash",
+                "gemini-3.5-flash",
+                "gemini-2.5-flash",
                 "gemini-2.0-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-3.5-flash-lite"
+                "gemini-3.5-flash-lite",
+                "gemini-2.5-flash-lite"
             )
             for (p in preferred) {
                 if (unlocked.contains(p)) return p
@@ -467,17 +470,27 @@ class OverlayService : Service() {
 
     private fun callGeminiFast(key: String, base64Image: String): String {
         val model = geminiModelCache[key] ?: "gemini-2.5-flash"
-        val sendZeroThinking = !noThinkingModels.contains(model)
 
-        var res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = sendZeroThinking)
+        // Determine thinking mode: 0 = Modern (thinkingLevel/thinkingBudget), 1 = Legacy budget, 2 = No thinkingConfig
+        val mode = when {
+            noThinkingModels.contains(model) -> 2
+            legacyThinkingModels.contains(model) -> 1
+            else -> 0
+        }
 
-        if (res == "ERR:400" && sendZeroThinking) {
+        var res = sendGeminiHttp(key, model, base64Image, thinkingMode = mode)
+
+        if (res == "ERR:400" && mode == 0) {
+            legacyThinkingModels.add(model)
+            res = sendGeminiHttp(key, model, base64Image, thinkingMode = 1)
+        }
+        if (res == "ERR:400" && mode <= 1) {
             noThinkingModels.add(model)
-            res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = false)
+            res = sendGeminiHttp(key, model, base64Image, thinkingMode = 2)
         } else if (res == "ERR:404") {
             val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
-            res = sendGeminiHttp(key, nextModel, base64Image, sendZeroThinkingConfig = !noThinkingModels.contains(nextModel))
+            res = sendGeminiHttp(key, nextModel, base64Image, thinkingMode = 0)
         }
 
         if (res.startsWith("ERR:")) {
@@ -491,7 +504,7 @@ class OverlayService : Service() {
         return res
     }
 
-    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, sendZeroThinkingConfig: Boolean): String {
+    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, thinkingMode: Int): String {
         return try {
             val encodedKey = URLEncoder.encode(key, "UTF-8")
             val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$encodedKey")
@@ -505,16 +518,7 @@ class OverlayService : Service() {
                 doOutput = true
             }
 
-            // LEFT-TO-RIGHT TRICK-SOLVER PROMPT:
-            // Forces the AI to write a 10-word logic/math check BEFORE the '|' pipe so it solves the trick BEFORE picking A/B/C/D!
-            val prompt = """
-                Solve the quiz question on screen carefully. Watch out for trick questions (ANTONYM vs SYNONYM, NOT/EXCEPT, grammar rules before/after blanks, or math order of operations).
-                Format your response strictly on ONE line with a '|' pipe symbol:
-                <brief 8-word logic or math step> | <Option Letter>) <Exact Answer>
-                Example 1: Antonym of accept means opposite -> reject | D) reject
-                Example 2: 'than' requires comparative adjective -> better | B) better
-                Example 3: 15 * 2 - 6 = 30 - 6 = 24 | C) 24
-            """.trimIndent()
+            val prompt = "Carefully solve the quiz question on screen. Watch out for trick questions: 1) ANTONYM (opposite) vs SYNONYM (similar), 2) NOT / EXCEPT / INCORRECT, 3) Grammar clues before/after blanks (like 'than' = comparative, 'the' = superlative, subject-verb agreement), 4) Math order of operations (BODMAS) and signs. After thinking, output ONLY the correct option letter and exact short answer (example: 'D) reject' or 'B) better'). NO explanation. Max 4 words."
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -526,11 +530,27 @@ class OverlayService : Service() {
             }
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
+            // CRITICAL: maxOutputTokens covers BOTH internal thought tokens + the 4-word answer.
+            // Setting 800 ensures internal thinking on trick questions NEVER gets cut off mid-thought!
             val genConfig = JSONObject().apply {
-                put("temperature", 0.0) // Deterministic 0.0 temperature so it never guesses randomly
-                put("maxOutputTokens", 55)
-                if (sendZeroThinkingConfig) {
-                    put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                put("maxOutputTokens", 800)
+                when (thinkingMode) {
+                    0 -> {
+                        if (modelName.startsWith("gemini-3")) {
+                            // Official Gemini 3.x fast reasoning level
+                            put("thinkingConfig", JSONObject().put("thinkingLevel", "LOW"))
+                        } else if (modelName.contains("lite")) {
+                            // Gemini 2.5 Flash-Lite requires minimum budget of 512
+                            put("thinkingConfig", JSONObject().put("thinkingBudget", 512))
+                        } else {
+                            // Gemini 2.5 Flash fast reasoning budget (~0.35s)
+                            put("thinkingConfig", JSONObject().put("thinkingBudget", 256))
+                        }
+                    }
+                    1 -> {
+                        put("thinkingConfig", JSONObject().put("thinkingBudget", 256))
+                    }
+                    // mode 2 omits thinkingConfig so the model uses its native default
                 }
             }
 
@@ -560,7 +580,7 @@ class OverlayService : Service() {
                     }
                 }
 
-                if (finalAnswer.isEmpty()) "ERR:Empty" else extractFinalAnswerAfterPipe(finalAnswer)
+                if (finalAnswer.isEmpty()) "ERR:Empty" else cleanShortOutput(finalAnswer)
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
@@ -572,23 +592,14 @@ class OverlayService : Service() {
         }
     }
 
-    // Strips everything before the '|' pipe so your overlay ONLY displays the clean option + answer (e.g. "D) reject")
-    private fun extractFinalAnswerAfterPipe(raw: String): String {
-        val clean = raw.replace("*", "").replace("\n", " ").trim()
-        val afterPipe = if (clean.contains("|")) {
-            clean.substringAfterLast("|").trim()
-        } else {
-            clean
+    private fun cleanShortOutput(raw: String): String {
+        val singleLine = raw.replace("*", "").replace("\n", " ").trim()
+        val match = Regex("""^([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,2})""").find(singleLine)
+        if (match != null) {
+            return match.groupValues[1].trim()
         }
-
-        // Look for pattern like "B) precise" or "C. 24"
-        val optionMatch = Regex("""([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,3})""").find(afterPipe)
-        if (optionMatch != null) {
-            return optionMatch.groupValues[1].trim()
-        }
-
-        val words = afterPipe.split(Regex("\\s+"))
-        return if (words.size > 5) words.take(4).joinToString(" ") else afterPipe
+        val words = singleLine.split(Regex("\\s+"))
+        return if (words.size > 5) words.take(4).joinToString(" ") else singleLine
     }
 
     private fun cleanupSessionOnly() {
