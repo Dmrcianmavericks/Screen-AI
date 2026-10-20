@@ -132,7 +132,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Fast Pair Mode Active")
+                .setContentText("Trick-Solver Fast Mode Active")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -149,8 +149,9 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        val width = (metrics.widthPixels * 0.55).toInt()
-        val height = (metrics.heightPixels * 0.55).toInt()
+        // Single-pass 0.56 scale keeps math symbols, exponents, and '___' blanks crisp without double-scaling blur
+        val width = (metrics.widthPixels * 0.56).toInt()
+        val height = (metrics.heightPixels * 0.56).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -337,16 +338,7 @@ class OverlayService : Service() {
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        // Scales image to 480px width max (~14KB Base64) so it uploads in <0.1s on any connection
-        val scaled = if (bitmap.width > 480) {
-            val ratio = 480f / bitmap.width
-            val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
-            Bitmap.createScaledBitmap(bitmap, 480, h, true)
-        } else {
-            bitmap
-        }
-        scaled.compress(Bitmap.CompressFormat.JPEG, 55, outputStream)
-        if (scaled !== bitmap) scaled.recycle()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, outputStream)
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -370,12 +362,6 @@ class OverlayService : Service() {
         return (ready + cooling).take(count)
     }
 
-    /**
-     * FAST 2-KEY PAIR RACE WITH INSTANT SPARE FAILOVER:
-     * - Fires 2 keys (Key B staggered by 100ms so uploads never collide).
-     * - The exact millisecond the first key answers (~0.9s - 1.3s), it returns immediately!
-     * - If a key fails with 429/403/401/404, that worker immediately grabs a spare key in 0ms instead of waiting for a timeout!
-     */
     private fun executeFastPairWithInstantFailover(base64Image: String): String {
         val total = apiKeys.size
         if (total == 1) {
@@ -415,7 +401,6 @@ class OverlayService : Service() {
                         if (errCode != "Time" || lastErr.get() == "Time") {
                             lastErr.set(errCode)
                         }
-                        // If this key failed with an HTTP error (like 429/403), grab a fresh key from the 8-key pool immediately!
                         currentKey = if (!solved.get() && usedKeys.size < total) {
                             synchronized(usedKeys) {
                                 val next = pickNextHealthyKeys(1, usedKeys).firstOrNull()
@@ -434,7 +419,6 @@ class OverlayService : Service() {
             }
         }
 
-        // Unlocks in ~1.0s as soon as the fastest key responds, or waits up to 6.0s on slow networks so it never falsely cuts off
         latch.await(6000, TimeUnit.MILLISECONDS)
         return winner.get() ?: "Err (${lastErr.get()})"
     }
@@ -462,6 +446,7 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
+            // Strictly prefers full Flash models over -lite models so trick questions aren't missed
             val preferred = listOf(
                 "gemini-2.5-flash",
                 "gemini-3.6-flash",
@@ -473,7 +458,8 @@ class OverlayService : Service() {
             for (p in preferred) {
                 if (unlocked.contains(p)) return p
             }
-            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+            unlocked.firstOrNull { it.contains("flash") && !it.contains("lite") && !it.contains("tts") && !it.contains("image") }
+                ?: unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
         } catch (e: Exception) {
             null
         }
@@ -486,7 +472,6 @@ class OverlayService : Service() {
         var res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = sendZeroThinking)
 
         if (res == "ERR:400" && sendZeroThinking) {
-            // Model does not accept thinkingConfig field; remember it and retry immediately without thinkingConfig
             noThinkingModels.add(model)
             res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = false)
         } else if (res == "ERR:404") {
@@ -516,12 +501,20 @@ class OverlayService : Service() {
                 setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
                 connectTimeout = 3000
-                // 5500ms read timeout ensures a working request is never killed mid-flight
                 readTimeout = 5500
                 doOutput = true
             }
 
-            val prompt = "Read the question and options (A/B/C/D) carefully. Check if it asks for SYNONYM, ANTONYM, Grammar, or Math. Reply ONLY with the correct option letter and exact short answer (example: 'D) reject' or 'C) 24'). NO explanation. Max 4 words."
+            // LEFT-TO-RIGHT TRICK-SOLVER PROMPT:
+            // Forces the AI to write a 10-word logic/math check BEFORE the '|' pipe so it solves the trick BEFORE picking A/B/C/D!
+            val prompt = """
+                Solve the quiz question on screen carefully. Watch out for trick questions (ANTONYM vs SYNONYM, NOT/EXCEPT, grammar rules before/after blanks, or math order of operations).
+                Format your response strictly on ONE line with a '|' pipe symbol:
+                <brief 8-word logic or math step> | <Option Letter>) <Exact Answer>
+                Example 1: Antonym of accept means opposite -> reject | D) reject
+                Example 2: 'than' requires comparative adjective -> better | B) better
+                Example 3: 15 * 2 - 6 = 30 - 6 = 24 | C) 24
+            """.trimIndent()
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -534,9 +527,9 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                put("maxOutputTokens", 45)
+                put("temperature", 0.0) // Deterministic 0.0 temperature so it never guesses randomly
+                put("maxOutputTokens", 55)
                 if (sendZeroThinkingConfig) {
-                    // CRITICAL FIX: Explicitly sets thinkingBudget = 0 so gemini-2.5-flash NEVER enters slow 8192-token dynamic thinking!
                     put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                 }
             }
@@ -567,7 +560,7 @@ class OverlayService : Service() {
                     }
                 }
 
-                if (finalAnswer.isEmpty()) "ERR:Empty" else cleanShortOutput(finalAnswer)
+                if (finalAnswer.isEmpty()) "ERR:Empty" else extractFinalAnswerAfterPipe(finalAnswer)
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
@@ -579,14 +572,23 @@ class OverlayService : Service() {
         }
     }
 
-    private fun cleanShortOutput(raw: String): String {
-        val singleLine = raw.replace("*", "").replace("\n", " ").trim()
-        val match = Regex("""^([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,2})""").find(singleLine)
-        if (match != null) {
-            return match.groupValues[1].trim()
+    // Strips everything before the '|' pipe so your overlay ONLY displays the clean option + answer (e.g. "D) reject")
+    private fun extractFinalAnswerAfterPipe(raw: String): String {
+        val clean = raw.replace("*", "").replace("\n", " ").trim()
+        val afterPipe = if (clean.contains("|")) {
+            clean.substringAfterLast("|").trim()
+        } else {
+            clean
         }
-        val words = singleLine.split(Regex("\\s+"))
-        return if (words.size > 5) words.take(4).joinToString(" ") else singleLine
+
+        // Look for pattern like "B) precise" or "C. 24"
+        val optionMatch = Regex("""([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,3})""").find(afterPipe)
+        if (optionMatch != null) {
+            return optionMatch.groupValues[1].trim()
+        }
+
+        val words = afterPipe.split(Regex("\\s+"))
+        return if (words.size > 5) words.take(4).joinToString(" ") else afterPipe
     }
 
     private fun cleanupSessionOnly() {
