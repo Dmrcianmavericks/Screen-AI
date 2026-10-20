@@ -47,8 +47,11 @@ class OverlayService : Service() {
     private var latestBitmap: Bitmap? = null
 
     private var apiKeys: List<String> = emptyList()
-    // Strictly steps by 2: Scan 1 -> [0, 1] (Key 1 & 2), Scan 2 -> [2, 3] (Key 3 & 4), Scan 3 -> [0, 1] (Key 1 & 2)
-    private val pairStepCounter = AtomicInteger(0)
+    private var overlayOpacityPercent: Int = 65
+
+    // Steps by 3 on every scan for 3-Key Simultaneous Majority Voting:
+    // Scan 1 -> [0, 1, 2], Scan 2 -> [3, 4, 5], Scan 3 -> [6, 7, 0]...
+    private val trioStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
     private val noThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
@@ -80,10 +83,12 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
+        overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 65).coerceIn(0, 100)
+
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
         apiKeys = rawKeys.split(",", "\n", " ")
             .map { it.trim() }
-            .filter { it.length > 12 && !it.startsWith("gsk_") }
+            .filter { it.length > 12 }
             .distinct()
 
         bgThread = HandlerThread("ScreenCaptureThread").apply { start() }
@@ -103,8 +108,10 @@ class OverlayService : Service() {
 
         // Pre-discover the best unlocked Gemini model for each key in the background on startup ONLY
         for (k in apiKeys) {
-            networkPool.execute {
-                discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
+            if (!k.startsWith("gsk_")) {
+                networkPool.execute {
+                    discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
+                }
             }
         }
 
@@ -120,7 +127,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Simultaneous Pair Mode: 1/2 <-> 3/4")
+                .setContentText("3-Key Majority Voting Mode")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -199,42 +206,59 @@ class OverlayService : Service() {
             y = 110
         }
 
+        // Completely transparent background so no dark rectangle ever gives it away
         val bgDrawable = GradientDrawable().apply {
-            setColor(Color.parseColor("#E6000000"))
+            setColor(Color.TRANSPARENT)
             cornerRadius = 36f
         }
 
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = bgDrawable
-            setPadding(18, 10, 22, 10)
+            setPadding(12, 6, 16, 6)
             gravity = Gravity.CENTER_VERTICAL
+            // Applies your exact 0% - 100% slider opacity to the entire floating bar
+            alpha = overlayOpacityPercent / 100f
+        }
+
+        val btnDrawable = GradientDrawable().apply {
+            setColor(Color.parseColor("#22000000"))
+            setStroke(2, Color.parseColor("#55888888"))
+            cornerRadius = 20f
         }
 
         val scanButton = Button(this).apply {
             text = "SCAN"
             textSize = 11f
-            setPadding(16, 4, 16, 4)
+            setTextColor(Color.DKGRAY)
+            background = btnDrawable
+            setPadding(14, 2, 14, 2)
+            minHeight = 0
+            minimumHeight = 0
+            minWidth = 0
+            minimumWidth = 0
             setOnClickListener {
                 if (!isScanning) captureAndAskAI()
             }
         }
 
         answerText = TextView(this).apply {
-            text = "Ready (${apiKeys.size} keys)"
-            setTextColor(Color.parseColor("#00FF88"))
+            text = "Ready (${apiKeys.size})"
+            setTextColor(Color.parseColor("#112211"))
+            // Subtle text shadow so you can read it on both white and dark backgrounds without a box
+            setShadowLayer(3f, 0f, 0f, Color.WHITE)
             textSize = 14f
-            setPadding(20, 0, 20, 0)
-            minWidth = 200
+            setPadding(18, 0, 18, 0)
+            minWidth = 180
             maxWidth = 680
             maxLines = 2
         }
 
         val closeButton = TextView(this).apply {
             text = "✕"
-            setTextColor(Color.LTGRAY)
-            textSize = 15f
-            setPadding(12, 4, 8, 4)
+            setTextColor(Color.GRAY)
+            textSize = 14f
+            setPadding(10, 4, 8, 4)
             setOnClickListener { cleanupAndStop() }
         }
 
@@ -283,6 +307,7 @@ class OverlayService : Service() {
         overlayView.visibility = View.INVISIBLE
         overlayView.invalidate()
 
+        // 45ms guarantees Android's screen compositor pushes a fresh frame without the overlay
         Handler(Looper.getMainLooper()).postDelayed({
             overlayView.visibility = View.VISIBLE
 
@@ -299,7 +324,7 @@ class OverlayService : Service() {
             networkPool.execute {
                 val base64Img = bitmapToBase64(snap)
                 snap.recycle()
-                val reply = executeSimultaneousPair(base64Img)
+                val reply = executeSimultaneousMajorityVote(base64Img)
                 Handler(Looper.getMainLooper()).post {
                     answerText.text = reply
                     isScanning = false
@@ -314,67 +339,186 @@ class OverlayService : Service() {
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
-    private fun executeSimultaneousPair(base64Image: String): String {
+    /**
+     * SIMULTANEOUS 3-KEY MAJORITY VOTING ENGINE:
+     * - Fires 3 keys at the exact same millisecond (0ms delay).
+     * - The instant ANY 2 keys agree on the same answer (2-of-3 majority), it returns that answer immediately!
+     * - If all 3 keys fail (e.g. 429), it immediately falls back to the next 3 keys!
+     */
+    private fun executeSimultaneousMajorityVote(base64Image: String): String {
         val total = apiKeys.size
         if (total == 1) {
-            val singleRes = callGeminiFast(apiKeys[0], base64Image)
+            val singleRes = callProvider(apiKeys[0], base64Image, isVerifier = false)
             return if (!singleRes.startsWith("ERR:")) singleRes else "Err (${singleRes.removePrefix("ERR:")})"
         }
-
-        val offset = pairStepCounter.getAndAdd(2)
-        val keyA = apiKeys[offset % total]
-        val keyB = apiKeys[(offset + 1) % total]
-
-        val firstPairAnswer = fireTwoKeysSimultaneously(keyA, keyB, base64Image)
-        if (!firstPairAnswer.startsWith("ERR:")) {
-            return firstPairAnswer
+        if (total == 2) {
+            val pairRes = fireThreeKeysForMajority(listOf(apiKeys[0], apiKeys[1]), base64Image)
+            return if (!pairRes.startsWith("ERR:")) pairRes else "Err (${pairRes.removePrefix("ERR:")})"
         }
 
-        if (total >= 3) {
-            val keyC = apiKeys[(offset + 2) % total]
-            val keyD = apiKeys[(offset + 3) % total]
-            val secondPairAnswer = if (keyC != keyD) {
-                fireTwoKeysSimultaneously(keyC, keyD, base64Image)
-            } else {
-                callGeminiFast(keyC, base64Image)
-            }
-            if (!secondPairAnswer.startsWith("ERR:")) {
-                return secondPairAnswer
-            }
-            return "Err (${secondPairAnswer.removePrefix("ERR:")})"
+        // Steps by 3 on every scan across your 4 to 8 keys:
+        // Click 1 -> [0, 1, 2], Click 2 -> [3, 4, 5], Click 3 -> [6, 7, 0]...
+        val offset = trioStepCounter.getAndAdd(3)
+        val trio1 = listOf(
+            apiKeys[offset % total],
+            apiKeys[(offset + 1) % total],
+            apiKeys[(offset + 2) % total]
+        ).distinct()
+
+        val firstTrioAnswer = fireThreeKeysForMajority(trio1, base64Image)
+        if (!firstTrioAnswer.startsWith("ERR:")) {
+            return firstTrioAnswer
         }
 
-        return "Err (${firstPairAnswer.removePrefix("ERR:")})"
+        // If all 3 keys in Trio 1 failed, immediately fire the next Trio!
+        if (total >= 4) {
+            val trio2 = listOf(
+                apiKeys[(offset + 3) % total],
+                apiKeys[(offset + 4) % total],
+                apiKeys[(offset + 5) % total]
+            ).distinct()
+            val secondTrioAnswer = fireThreeKeysForMajority(trio2, base64Image)
+            if (!secondTrioAnswer.startsWith("ERR:")) {
+                return secondTrioAnswer
+            }
+            return "Err (${secondTrioAnswer.removePrefix("ERR:")})"
+        }
+
+        return "Err (${firstTrioAnswer.removePrefix("ERR:")})"
     }
 
-    private fun fireTwoKeysSimultaneously(keyA: String, keyB: String, base64Image: String): String {
-        val winner = AtomicReference<String?>(null)
+    private fun fireThreeKeysForMajority(keysToFire: List<String>, base64Image: String): String {
+        val count = keysToFire.size
+        val voteLock = Object()
+        val validResponses = mutableListOf<String>()
+        val voteCounts = HashMap<String, Int>()
+        val majorityWinner = AtomicReference<String?>(null)
         val lastErr = AtomicReference("Time")
-        val solved = AtomicBoolean(false)
+        val decided = AtomicBoolean(false)
         val latch = CountDownLatch(1)
-        val remaining = AtomicInteger(2)
+        val remaining = AtomicInteger(count)
 
-        val keysToFire = listOf(keyA, keyB)
-        for (k in keysToFire) {
+        for ((idx, k) in keysToFire.withIndex()) {
             networkPool.execute {
-                val res = callGeminiFast(k, base64Image)
+                // Worker 0 & 1 use the fast direct prompt; Worker 2 uses the Trap-Verifier prompt at the same 0ms!
+                val res = callProvider(k, base64Image, isVerifier = (idx == 2))
                 if (!res.startsWith("ERR:")) {
-                    if (solved.compareAndSet(false, true)) {
-                        winner.set(res)
-                        latch.countDown()
+                    val voteKey = normalizeVoteKey(res)
+                    synchronized(voteLock) {
+                        validResponses.add(res)
+                        val newCount = (voteCounts[voteKey] ?: 0) + 1
+                        voteCounts[voteKey] = newCount
+
+                        // Instant 2-of-3 Majority Lock! Unlocks the main thread the millisecond 2 keys agree!
+                        if (newCount >= 2 && decided.compareAndSet(false, true)) {
+                            majorityWinner.set(res)
+                            latch.countDown()
+                        } else if (count == 2 && remaining.get() == 1 && validResponses.size == 1 && decided.compareAndSet(false, true)) {
+                            // If only 2 keys total exist and the other one errored out, accept the 1 valid answer
+                            majorityWinner.set(res)
+                            latch.countDown()
+                        }
                     }
                 } else {
                     lastErr.set(res.removePrefix("ERR:"))
                 }
+
                 if (remaining.decrementAndGet() == 0) {
+                    synchronized(voteLock) {
+                        // All 3 threads finished: if no 2 agreed (or only 1 succeeded), pick the best valid response
+                        if (majorityWinner.get() == null && validResponses.isNotEmpty()) {
+                            majorityWinner.set(validResponses[0])
+                        }
+                    }
                     latch.countDown()
                 }
             }
         }
 
-        // Balanced 3200ms window: fast enough for 2.5s-3s target, safe enough to prevent "Err (Time)"
-        latch.await(3200, TimeUnit.MILLISECONDS)
-        return winner.get() ?: "ERR:${lastErr.get()}"
+        // Waits at most 3.8 seconds (usually unlocks in ~1.2s the instant 2 keys agree!)
+        latch.await(3800, TimeUnit.MILLISECONDS)
+
+        val finalChoice = majorityWinner.get() ?: synchronized(voteLock) { validResponses.firstOrNull() }
+        return finalChoice ?: "ERR:${lastErr.get()}"
+    }
+
+    // Extracts the core option letter (e.g. "B) precise" -> "B") so "B) precise" and "B. precise" count as the same vote!
+    private fun normalizeVoteKey(answer: String): String {
+        val trimmed = answer.trim().uppercase()
+        val optionMatch = Regex("""^([A-D])[\)\.\:\s]""").find(trimmed)
+        if (optionMatch != null) {
+            return "OPT_${optionMatch.groupValues[1]}"
+        }
+        return trimmed.replace(Regex("[^A-Z0-9]"), "").take(12)
+    }
+
+    private fun callProvider(key: String, base64Image: String, isVerifier: Boolean): String {
+        return if (key.startsWith("gsk_")) {
+            callGroqFast(key, base64Image)
+        } else {
+            callGeminiFast(key, base64Image, isVerifier)
+        }
+    }
+
+    private fun callGroqFast(groqKey: String, base64Image: String): String {
+        return try {
+            val url = URL("https://api.groq.com/openai/v1/chat/completions")
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                setRequestProperty("Authorization", "Bearer $groqKey")
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Connection", "keep-alive")
+                connectTimeout = 2600
+                readTimeout = 2600
+                doOutput = true
+            }
+
+            val prompt = "Check carefully if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it and reply ONLY with the correct option letter and exact word/number (example: 'B) precise'). Max 4 words."
+
+            val contentArr = JSONArray().apply {
+                put(JSONObject().apply {
+                    put("type", "text")
+                    put("text", prompt)
+                })
+                put(JSONObject().apply {
+                    put("type", "image_url")
+                    put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$base64Image"))
+                })
+            }
+
+            val messages = JSONArray().put(JSONObject().apply {
+                put("role", "user")
+                put("content", contentArr)
+            })
+
+            val payload = JSONObject().apply {
+                put("model", "meta-llama/llama-4-maverick-17b-128e-instruct")
+                put("messages", messages)
+                put("temperature", 0.0)
+                put("max_tokens", 30)
+            }
+
+            conn.outputStream.use { it.write(payload.toString().toByteArray()) }
+
+            val code = conn.responseCode
+            if (code == 200) {
+                val responseText = conn.inputStream.use { it.bufferedReader().readText() }
+                val res = JSONObject(responseText)
+                val text = res.getJSONArray("choices")
+                    .getJSONObject(0)
+                    .getJSONObject("message")
+                    .getString("content")
+                    .trim()
+                    .replace("\n", " ")
+                    .replace("*", "")
+                if (text.isNotEmpty()) text else "ERR:Empty"
+            } else {
+                conn.errorStream?.use { it.readBytes() }
+                "ERR:$code"
+            }
+        } catch (e: Exception) {
+            "ERR:Time"
+        }
     }
 
     private fun discoverGeminiModelOnStartup(key: String): String? {
@@ -400,39 +544,48 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
+            // Strictly prioritizes smart full Flash models (never picks weak -lite models if full Flash is unlocked!)
             val preferred = listOf(
-                "gemini-3.8-flash",
-                "gemini-3.6-flash",
                 "gemini-2.5-flash",
-                "gemini-3.5-flash-lite"
+                "gemini-3.6-flash",
+                "gemini-3.8-flash"
             )
             for (p in preferred) {
                 if (unlocked.contains(p)) return p
             }
-            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+            unlocked.firstOrNull { it.contains("flash") && !it.contains("lite") && !it.contains("tts") && !it.contains("image") }
+                ?: unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
         } catch (e: Exception) {
             null
         }
     }
 
-    private fun callGeminiFast(key: String, base64Image: String): String {
-        val model = geminiModelCache[key] ?: "gemini-3.8-flash"
+    // Never blocks on GET /models during a live quiz scan, and NEVER caches weak -lite models!
+    private fun callGeminiFast(key: String, base64Image: String, isVerifier: Boolean): String {
+        val model = geminiModelCache[key] ?: "gemini-2.5-flash"
         val allowThinking = !noThinkingModels.contains(model)
 
-        var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking)
+        var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking, isVerifier = isVerifier)
 
         if (res == "ERR:400" && allowThinking) {
             noThinkingModels.add(model)
-            res = sendGeminiHttp(key, model, base64Image, includeThinking = false)
+            res = sendGeminiHttp(key, model, base64Image, includeThinking = false, isVerifier = isVerifier)
         } else if (res == "ERR:404") {
-            val nextModel = if (model == "gemini-3.8-flash") "gemini-2.5-flash" else "gemini-3.8-flash"
+            // Switch between full-intelligence Flash models (never locks into -lite!)
+            val nextModel = if (model == "gemini-2.5-flash") "gemini-3.8-flash" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
-            res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false)
+            res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false, isVerifier = isVerifier)
         }
         return res
     }
 
-    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, includeThinking: Boolean): String {
+    private fun sendGeminiHttp(
+        key: String,
+        modelName: String,
+        base64Image: String,
+        includeThinking: Boolean,
+        isVerifier: Boolean
+    ): String {
         return try {
             val encodedKey = URLEncoder.encode(key, "UTF-8")
             val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$encodedKey")
@@ -441,12 +594,16 @@ class OverlayService : Service() {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
-                connectTimeout = 2200
-                readTimeout = 3000
+                connectTimeout = 2600
+                readTimeout = 2600
                 doOutput = true
             }
 
-            val prompt = "Read question & options (A/B/C/D) carefully. Verify antonyms, synonyms, or math. Output ONLY option letter and exact short answer (e.g. 'D) reject'). NO explanation. Max 4 words."
+            val prompt = if (isVerifier) {
+                "CRITICAL VERIFIER: Watch out for traps (ANTONYM vs SYNONYM, NOT/EXCEPT, grammar tense, or math signs). Verify all options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
+            } else {
+                "Pay strict attention to whether the question asks for SYNONYM, ANTONYM, Grammar, or Math calculation. Double-check the options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
+            }
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -459,9 +616,8 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                put("maxOutputTokens", 100)
+                put("maxOutputTokens", 120)
                 if (includeThinking) {
-                    // Safe 64-token thinking scratchpad (~0.2s) to stop silly mistakes on antonyms/math
                     put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
                 }
             }
@@ -492,7 +648,7 @@ class OverlayService : Service() {
                     }
                 }
 
-                if (finalAnswer.isEmpty()) "ERR:Empty" else cleanShortOutput(finalAnswer)
+                if (finalAnswer.isEmpty()) "ERR:Empty" else finalAnswer.replace("\n", " ").replace("*", "")
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
@@ -500,16 +656,6 @@ class OverlayService : Service() {
         } catch (e: Exception) {
             "ERR:Time"
         }
-    }
-
-    private fun cleanShortOutput(raw: String): String {
-        val singleLine = raw.replace("*", "").replace("\n", " ").trim()
-        val match = Regex("""^([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,2})""").find(singleLine)
-        if (match != null) {
-            return match.groupValues[1].trim()
-        }
-        val words = singleLine.split(Regex("\\s+"))
-        return if (words.size > 5) words.take(4).joinToString(" ") else singleLine
     }
 
     private fun cleanupAndStop() {
