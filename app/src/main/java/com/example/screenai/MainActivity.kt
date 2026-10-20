@@ -60,19 +60,19 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(60, 160, 60, 80)
+            setPadding(60, 140, 60, 80)
             setBackgroundColor(Color.WHITE)
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (3-Key Majority Vote)"
+            text = "ScreenAI (8-Key Majority Vote)"
             textSize = 20f
             setTextColor(Color.BLACK)
             setPadding(0, 0, 0, 12)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Paste 3 to 8 keys below. Fires 3 keys simultaneously on every scan and picks the 2-out-of-3 majority answer in ~1.2s!"
+            text = "Paste up to 8 Gemini keys below. Fires 3 keys simultaneously per scan and locks in the 2-of-3 majority answer in ~1.2s!"
             textSize = 13f
             setTextColor(Color.DKGRAY)
             setPadding(0, 0, 0, 24)
@@ -81,8 +81,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(title)
         layout.addView(subtitle)
 
-        // Smooth 0% - 100% Opacity Slider
-        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 65)
+        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 70)
 
         opacityLabel = TextView(this).apply {
             text = "Stealth Overlay Opacity: $savedOpacity%"
@@ -107,7 +106,6 @@ class MainActivity : AppCompatActivity() {
         layout.addView(opacityLabel)
         layout.addView(opacitySeekBar)
 
-        // 8 Key Input Boxes (compatible with your existing SAFE_KEY_1..4 + new SAFE_KEY_5..8)
         keyInputs.clear()
         for (i in 1..8) {
             val savedKey = prefs.getString("SAFE_KEY_$i", "") ?: ""
@@ -119,7 +117,7 @@ class MainActivity : AppCompatActivity() {
         val startBtn = Button(this).apply {
             text = "Start AI Overlay"
             setOnClickListener {
-                val activeKeys = keyInputs.map { it.text.toString().trim() }.filter { it.isNotEmpty() }
+                val activeKeys = keyInputs.map { it.text.toString().trim() }.filter { it.length > 12 }
                 if (activeKeys.isEmpty()) {
                     Toast.makeText(context, "Paste at least 1 API key!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
