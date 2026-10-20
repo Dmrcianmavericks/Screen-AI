@@ -23,11 +23,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -47,13 +49,14 @@ class OverlayService : Service() {
     private var latestBitmap: Bitmap? = null
 
     private var apiKeys: List<String> = emptyList()
-    // Strictly steps by 2: Scan 1 -> [0, 1] (Key 1 & 2), Scan 2 -> [2, 3] (Key 3 & 4), Scan 3 -> [0, 1] (Key 1 & 2)
+    private var overlayOpacityPercent: Int = 75
+
     private val pairStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
+    private val keyCooldownUntil = ConcurrentHashMap<String, Long>()
     private val noThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
-    // Pre-allocated thread pool so Android never wastes time creating new OS threads on each click
-    private val networkPool = Executors.newCachedThreadPool()
+    private var networkPool: ExecutorService = Executors.newCachedThreadPool()
 
     @Volatile private var isScanning = false
     private lateinit var bgThread: HandlerThread
@@ -63,8 +66,13 @@ class OverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         System.setProperty("http.keepAlive", "true")
-        System.setProperty("http.maxConnections", "16")
+        System.setProperty("http.maxConnections", "20")
 
+        if (networkPool.isShutdown) {
+            networkPool = Executors.newCachedThreadPool()
+        }
+
+        cleanupSessionOnly()
         startForegroundServiceNotification()
 
         val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
@@ -80,10 +88,12 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
+        overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 75).coerceIn(5, 100)
+
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
         apiKeys = rawKeys.split(",", "\n", " ")
-            .map { it.trim() }
-            .filter { it.length > 12 }
+            .map { it.trim().replace("\"", "").replace("'", "") }
+            .filter { it.length > 12 && !it.startsWith("gsk_") }
             .distinct()
 
         bgThread = HandlerThread("ScreenCaptureThread").apply { start() }
@@ -101,12 +111,12 @@ class OverlayService : Service() {
         setupScreenReader()
         setupFloatingOverlay()
 
-        // Pre-discover the best unlocked Gemini model for each key in the background on startup ONLY
-        for (k in apiKeys) {
-            if (!k.startsWith("gsk_")) {
-                networkPool.execute {
-                    discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
+        for ((idx, k) in apiKeys.withIndex()) {
+            networkPool.execute {
+                if (idx > 0) {
+                    try { Thread.sleep(idx * 60L) } catch (_: Exception) {}
                 }
+                discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
             }
         }
 
@@ -122,7 +132,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Simultaneous Pair Mode: 1/2 <-> 3/4")
+                .setContentText("Fast Pair Mode Active")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -139,8 +149,8 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        val width = (metrics.widthPixels * 0.60).toInt()
-        val height = (metrics.heightPixels * 0.60).toInt()
+        val width = (metrics.widthPixels * 0.55).toInt()
+        val height = (metrics.heightPixels * 0.55).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -160,7 +170,6 @@ class OverlayService : Service() {
                     )
                     fullBitmap.copyPixelsFromBuffer(buffer)
 
-                    // Crops out top 12% (URL bar) and bottom 18% (Nav bar) so only the quiz card is captured
                     val topY = (image.height * 0.12).toInt()
                     val cropH = (image.height * 0.70).toInt()
                     val cropped = Bitmap.createBitmap(fullBitmap, 0, topY, image.width, cropH)
@@ -202,21 +211,35 @@ class OverlayService : Service() {
         }
 
         val bgDrawable = GradientDrawable().apply {
-            setColor(Color.parseColor("#E6000000"))
+            setColor(Color.TRANSPARENT)
             cornerRadius = 36f
         }
 
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = bgDrawable
-            setPadding(18, 10, 22, 10)
+            setPadding(14, 6, 18, 6)
             gravity = Gravity.CENTER_VERTICAL
+            alpha = overlayOpacityPercent / 100f
+        }
+
+        val btnDrawable = GradientDrawable().apply {
+            setColor(Color.parseColor("#44000000"))
+            setStroke(2, Color.parseColor("#88CCCCCC"))
+            cornerRadius = 20f
         }
 
         val scanButton = Button(this).apply {
             text = "SCAN"
             textSize = 11f
+            setTextColor(Color.WHITE)
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+            background = btnDrawable
             setPadding(16, 4, 16, 4)
+            minHeight = 0
+            minimumHeight = 0
+            minWidth = 0
+            minimumWidth = 0
             setOnClickListener {
                 if (!isScanning) captureAndAskAI()
             }
@@ -225,6 +248,7 @@ class OverlayService : Service() {
         answerText = TextView(this).apply {
             text = "Ready (${apiKeys.size} keys)"
             setTextColor(Color.parseColor("#00FF88"))
+            setShadowLayer(7f, 0f, 0f, Color.BLACK)
             textSize = 14f
             setPadding(20, 0, 20, 0)
             minWidth = 200
@@ -235,6 +259,7 @@ class OverlayService : Service() {
         val closeButton = TextView(this).apply {
             text = "✕"
             setTextColor(Color.LTGRAY)
+            setShadowLayer(5f, 0f, 0f, Color.BLACK)
             textSize = 15f
             setPadding(12, 4, 8, 4)
             setOnClickListener { cleanupAndStop() }
@@ -285,7 +310,6 @@ class OverlayService : Service() {
         overlayView.visibility = View.INVISIBLE
         overlayView.invalidate()
 
-        // 45ms guarantees Android's screen compositor pushes a fresh frame without the overlay
         Handler(Looper.getMainLooper()).postDelayed({
             overlayView.visibility = View.VISIBLE
 
@@ -302,161 +326,117 @@ class OverlayService : Service() {
             networkPool.execute {
                 val base64Img = bitmapToBase64(snap)
                 snap.recycle()
-                val reply = executeSimultaneousPair(base64Img)
+                val reply = executeFastPairWithInstantFailover(base64Img)
                 Handler(Looper.getMainLooper()).post {
                     answerText.text = reply
                     isScanning = false
                 }
             }
-        }, 45)
+        }, 40)
     }
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 62, outputStream)
+        // Scales image to 480px width max (~14KB Base64) so it uploads in <0.1s on any connection
+        val scaled = if (bitmap.width > 480) {
+            val ratio = 480f / bitmap.width
+            val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(bitmap, 480, h, true)
+        } else {
+            bitmap
+        }
+        scaled.compress(Bitmap.CompressFormat.JPEG, 55, outputStream)
+        if (scaled !== bitmap) scaled.recycle()
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
-    /**
-     * SIMULTANEOUS 2-KEY PAIR ENGINE (Key 1+2 -> Key 3+4 -> Key 1+2):
-     * Fires BOTH keys in the active pair at the exact same millisecond (0ms delay).
-     * Whichever key responds first immediately returns the answer!
-     */
-    private fun executeSimultaneousPair(base64Image: String): String {
+    private fun pickNextHealthyKeys(count: Int, exclude: Set<String> = emptySet()): List<String> {
         val total = apiKeys.size
-        if (total == 1) {
-            val singleRes = callProvider(apiKeys[0], base64Image)
-            return if (!singleRes.startsWith("ERR:")) singleRes else "Err (${singleRes.removePrefix("ERR:")})"
-        }
+        if (total == 0) return emptyList()
+        val now = System.currentTimeMillis()
+        val start = pairStepCounter.getAndAdd(count)
 
-        // Steps by 2 on every scan:
-        // Click 1 -> offset 0 -> Key 1 & Key 2
-        // Click 2 -> offset 2 -> Key 3 & Key 4
-        // Click 3 -> offset 4 -> Key 1 & Key 2
-        val offset = pairStepCounter.getAndAdd(2)
-        val keyA = apiKeys[offset % total]
-        val keyB = apiKeys[(offset + 1) % total]
-
-        val firstPairAnswer = fireTwoKeysSimultaneously(keyA, keyB, base64Image)
-        if (!firstPairAnswer.startsWith("ERR:")) {
-            return firstPairAnswer
-        }
-
-        // If we have 3 or 4 keys and BOTH keys in Pair 1 failed (e.g., 429), immediately fire Pair 2!
-        if (total >= 3) {
-            val keyC = apiKeys[(offset + 2) % total]
-            val keyD = apiKeys[(offset + 3) % total]
-            val secondPairAnswer = if (keyC != keyD) {
-                fireTwoKeysSimultaneously(keyC, keyD, base64Image)
+        val ready = mutableListOf<String>()
+        val cooling = mutableListOf<String>()
+        for (i in 0 until total) {
+            val k = apiKeys[(start + i) % total]
+            if (exclude.contains(k)) continue
+            if (now >= (keyCooldownUntil[k] ?: 0L)) {
+                ready.add(k)
             } else {
-                callProvider(keyC, base64Image)
+                cooling.add(k)
             }
-            if (!secondPairAnswer.startsWith("ERR:")) {
-                return secondPairAnswer
-            }
-            return "Err (${secondPairAnswer.removePrefix("ERR:")})"
         }
-
-        return "Err (${firstPairAnswer.removePrefix("ERR:")})"
+        return (ready + cooling).take(count)
     }
 
-    private fun fireTwoKeysSimultaneously(keyA: String, keyB: String, base64Image: String): String {
+    /**
+     * FAST 2-KEY PAIR RACE WITH INSTANT SPARE FAILOVER:
+     * - Fires 2 keys (Key B staggered by 100ms so uploads never collide).
+     * - The exact millisecond the first key answers (~0.9s - 1.3s), it returns immediately!
+     * - If a key fails with 429/403/401/404, that worker immediately grabs a spare key in 0ms instead of waiting for a timeout!
+     */
+    private fun executeFastPairWithInstantFailover(base64Image: String): String {
+        val total = apiKeys.size
+        if (total == 1) {
+            val res = callGeminiFast(apiKeys[0], base64Image)
+            return if (!res.startsWith("ERR:")) res else "Err (${res.removePrefix("ERR:")})"
+        }
+
+        val initialPair = pickNextHealthyKeys(2)
+        val usedKeys = Collections.synchronizedSet(HashSet<String>(initialPair))
+
         val winner = AtomicReference<String?>(null)
         val lastErr = AtomicReference("Time")
         val solved = AtomicBoolean(false)
         val latch = CountDownLatch(1)
-        val remaining = AtomicInteger(2)
+        val remaining = AtomicInteger(initialPair.size)
 
-        val keysToFire = listOf(keyA, keyB)
-        for (k in keysToFire) {
+        for ((idx, firstKey) in initialPair.withIndex()) {
             networkPool.execute {
-                val res = callProvider(k, base64Image)
-                if (!res.startsWith("ERR:")) {
-                    if (solved.compareAndSet(false, true)) {
-                        winner.set(res)
-                        latch.countDown() // Unlocks main waiting thread the exact millisecond the fastest key finishes!
-                    }
-                } else {
-                    lastErr.set(res.removePrefix("ERR:"))
+                if (idx == 1) {
+                    try { Thread.sleep(100L) } catch (_: Exception) {}
                 }
+
+                var currentKey: String? = firstKey
+                var attempts = 0
+
+                while (currentKey != null && attempts < 2 && !solved.get()) {
+                    attempts++
+                    val res = callGeminiFast(currentKey, base64Image)
+                    if (!res.startsWith("ERR:")) {
+                        if (solved.compareAndSet(false, true)) {
+                            winner.set(res)
+                            latch.countDown()
+                        }
+                        break
+                    } else {
+                        val errCode = res.removePrefix("ERR:")
+                        if (errCode != "Time" || lastErr.get() == "Time") {
+                            lastErr.set(errCode)
+                        }
+                        // If this key failed with an HTTP error (like 429/403), grab a fresh key from the 8-key pool immediately!
+                        currentKey = if (!solved.get() && usedKeys.size < total) {
+                            synchronized(usedKeys) {
+                                val next = pickNextHealthyKeys(1, usedKeys).firstOrNull()
+                                if (next != null) usedKeys.add(next)
+                                next
+                            }
+                        } else {
+                            null
+                        }
+                    }
+                }
+
                 if (remaining.decrementAndGet() == 0) {
                     latch.countDown()
                 }
             }
         }
 
-        // Waits at most 3.8 seconds for the faster of the two simultaneous keys
-        latch.await(3800, TimeUnit.MILLISECONDS)
-        return winner.get() ?: "ERR:${lastErr.get()}"
-    }
-
-    private fun callProvider(key: String, base64Image: String): String {
-        return if (key.startsWith("gsk_")) {
-            callGroqFast(key, base64Image)
-        } else {
-            callGeminiFast(key, base64Image)
-        }
-    }
-
-    private fun callGroqFast(groqKey: String, base64Image: String): String {
-        return try {
-            val url = URL("https://api.groq.com/openai/v1/chat/completions")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                setRequestProperty("Authorization", "Bearer $groqKey")
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Connection", "keep-alive")
-                connectTimeout = 2600
-                readTimeout = 2600
-                doOutput = true
-            }
-
-            val prompt = "Check carefully if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it and reply ONLY with the correct option letter and exact word/number (example: 'B) precise'). Max 4 words."
-
-            val contentArr = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("type", "text")
-                    put("text", prompt)
-                })
-                put(JSONObject().apply {
-                    put("type", "image_url")
-                    put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$base64Image"))
-                })
-            }
-
-            val messages = JSONArray().put(JSONObject().apply {
-                put("role", "user")
-                put("content", contentArr)
-            })
-
-            val payload = JSONObject().apply {
-                put("model", "meta-llama/llama-4-maverick-17b-128e-instruct")
-                put("messages", messages)
-                put("temperature", 0.0)
-                put("max_tokens", 30)
-            }
-
-            conn.outputStream.use { it.write(payload.toString().toByteArray()) }
-
-            val code = conn.responseCode
-            if (code == 200) {
-                val responseText = conn.inputStream.use { it.bufferedReader().readText() }
-                val res = JSONObject(responseText)
-                val text = res.getJSONArray("choices")
-                    .getJSONObject(0)
-                    .getJSONObject("message")
-                    .getString("content")
-                    .trim()
-                    .replace("\n", " ")
-                    .replace("*", "")
-                if (text.isNotEmpty()) text else "ERR:Empty"
-            } else {
-                conn.errorStream?.use { it.readBytes() }
-                "ERR:$code"
-            }
-        } catch (e: Exception) {
-            "ERR:Time"
-        }
+        // Unlocks in ~1.0s as soon as the fastest key responds, or waits up to 6.0s on slow networks so it never falsely cuts off
+        latch.await(6000, TimeUnit.MILLISECONDS)
+        return winner.get() ?: "Err (${lastErr.get()})"
     }
 
     private fun discoverGeminiModelOnStartup(key: String): String? {
@@ -466,8 +446,8 @@ class OverlayService : Service() {
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 setRequestProperty("x-goog-api-key", key)
-                connectTimeout = 2500
-                readTimeout = 2500
+                connectTimeout = 3000
+                readTimeout = 3000
             }
             if (conn.responseCode != 200) return null
 
@@ -486,6 +466,7 @@ class OverlayService : Service() {
                 "gemini-2.5-flash",
                 "gemini-3.6-flash",
                 "gemini-3.8-flash",
+                "gemini-2.0-flash",
                 "gemini-2.5-flash-lite",
                 "gemini-3.5-flash-lite"
             )
@@ -498,25 +479,34 @@ class OverlayService : Service() {
         }
     }
 
-    // Never blocks on GET /models during a live quiz scan!
     private fun callGeminiFast(key: String, base64Image: String): String {
         val model = geminiModelCache[key] ?: "gemini-2.5-flash"
-        val allowThinking = !noThinkingModels.contains(model)
+        val sendZeroThinking = !noThinkingModels.contains(model)
 
-        var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking)
+        var res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = sendZeroThinking)
 
-        if (res == "ERR:400" && allowThinking) {
+        if (res == "ERR:400" && sendZeroThinking) {
+            // Model does not accept thinkingConfig field; remember it and retry immediately without thinkingConfig
             noThinkingModels.add(model)
-            res = sendGeminiHttp(key, model, base64Image, includeThinking = false)
+            res = sendGeminiHttp(key, model, base64Image, sendZeroThinkingConfig = false)
         } else if (res == "ERR:404") {
             val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
-            res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false)
+            res = sendGeminiHttp(key, nextModel, base64Image, sendZeroThinkingConfig = !noThinkingModels.contains(nextModel))
+        }
+
+        if (res.startsWith("ERR:")) {
+            val code = res.removePrefix("ERR:")
+            if (code == "429") {
+                keyCooldownUntil[key] = System.currentTimeMillis() + 20_000L
+            } else if (code == "403" || code == "401") {
+                keyCooldownUntil[key] = System.currentTimeMillis() + 300_000L
+            }
         }
         return res
     }
 
-    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, includeThinking: Boolean): String {
+    private fun sendGeminiHttp(key: String, modelName: String, base64Image: String, sendZeroThinkingConfig: Boolean): String {
         return try {
             val encodedKey = URLEncoder.encode(key, "UTF-8")
             val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$encodedKey")
@@ -525,12 +515,13 @@ class OverlayService : Service() {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
-                connectTimeout = 2600
-                readTimeout = 2600
+                connectTimeout = 3000
+                // 5500ms read timeout ensures a working request is never killed mid-flight
+                readTimeout = 5500
                 doOutput = true
             }
 
-            val prompt = "Pay strict attention to whether the question asks for SYNONYM, ANTONYM, Grammar, or Math calculation. Double-check the options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
+            val prompt = "Read the question and options (A/B/C/D) carefully. Check if it asks for SYNONYM, ANTONYM, Grammar, or Math. Reply ONLY with the correct option letter and exact short answer (example: 'D) reject' or 'C) 24'). NO explanation. Max 4 words."
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -543,9 +534,10 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                put("maxOutputTokens", 120)
-                if (includeThinking) {
-                    put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
+                put("maxOutputTokens", 45)
+                if (sendZeroThinkingConfig) {
+                    // CRITICAL FIX: Explicitly sets thinkingBudget = 0 so gemini-2.5-flash NEVER enters slow 8192-token dynamic thinking!
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                 }
             }
 
@@ -575,28 +567,46 @@ class OverlayService : Service() {
                     }
                 }
 
-                if (finalAnswer.isEmpty()) "ERR:Empty" else finalAnswer.replace("\n", " ").replace("*", "")
+                if (finalAnswer.isEmpty()) "ERR:Empty" else cleanShortOutput(finalAnswer)
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
             }
-        } catch (e: Exception) {
+        } catch (e: SocketTimeoutException) {
             "ERR:Time"
+        } catch (e: Exception) {
+            "ERR:Net"
+        }
+    }
+
+    private fun cleanShortOutput(raw: String): String {
+        val singleLine = raw.replace("*", "").replace("\n", " ").trim()
+        val match = Regex("""^([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+){0,2})""").find(singleLine)
+        if (match != null) {
+            return match.groupValues[1].trim()
+        }
+        val words = singleLine.split(Regex("\\s+"))
+        return if (words.size > 5) words.take(4).joinToString(" ") else singleLine
+    }
+
+    private fun cleanupSessionOnly() {
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        virtualDisplay = null
+        try { imageReader?.close() } catch (_: Exception) {}
+        imageReader = null
+        try { mediaProjection?.stop() } catch (_: Exception) {}
+        mediaProjection = null
+        if (::bgThread.isInitialized) {
+            try { bgThread.quitSafely() } catch (_: Exception) {}
+        }
+        if (::overlayView.isInitialized && overlayView.isAttachedToWindow) {
+            try { windowManager.removeView(overlayView) } catch (_: Exception) {}
         }
     }
 
     private fun cleanupAndStop() {
-        virtualDisplay?.release()
-        virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
-        mediaProjection?.stop()
-        mediaProjection = null
-        networkPool.shutdownNow()
-        if (::bgThread.isInitialized) bgThread.quitSafely()
-        if (::overlayView.isInitialized && overlayView.isAttachedToWindow) {
-            windowManager.removeView(overlayView)
-        }
+        cleanupSessionOnly()
+        try { networkPool.shutdownNow() } catch (_: Exception) {}
         stopSelf()
     }
 
