@@ -23,10 +23,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
-import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -47,14 +48,15 @@ class OverlayService : Service() {
     private val bitmapLock = Object()
     private var latestBitmap: Bitmap? = null
 
-    private var apiKeys: List<String> = emptyList()
+    // Thread-safe active key pool: dead 401/403 keys are automatically removed so they never break a scan
+    private val activeKeys = CopyOnWriteArrayList<String>()
     private var overlayOpacityPercent: Int = 70
 
-    // Rotates cleanly across all 8 keys
     private val keyStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
     private val keyCooldownUntil = ConcurrentHashMap<String, Long>()
     private val noThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+    private val vertexEndpointKeys = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     private var networkPool: ExecutorService = Executors.newCachedThreadPool()
 
@@ -72,9 +74,7 @@ class OverlayService : Service() {
             networkPool = Executors.newCachedThreadPool()
         }
 
-        // Clean up any existing overlay/session if user restarted from MainActivity
         cleanupSessionOnly()
-
         startForegroundServiceNotification()
 
         val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
@@ -93,10 +93,13 @@ class OverlayService : Service() {
         overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 70).coerceIn(5, 100)
 
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
-        apiKeys = rawKeys.split(",", "\n", " ")
-            .map { it.trim() }
+        val parsedKeys = rawKeys.split(",", "\n", " ")
+            .map { it.trim().replace("\"", "").replace("'", "") }
             .filter { it.length > 12 && !it.startsWith("gsk_") }
             .distinct()
+
+        activeKeys.clear()
+        activeKeys.addAll(parsedKeys)
 
         bgThread = HandlerThread("ScreenCaptureThread").apply { start() }
         bgHandler = Handler(bgThread.looper)
@@ -113,13 +116,13 @@ class OverlayService : Service() {
         setupScreenReader()
         setupFloatingOverlay()
 
-        // Stagger startup model discovery by 80ms per key so 8 simultaneous GET calls don't choke startup
-        for ((idx, k) in apiKeys.withIndex()) {
+        // Validate keys and cache their fastest unlocked model on startup
+        for ((idx, k) in parsedKeys.withIndex()) {
             networkPool.execute {
                 if (idx > 0) {
-                    try { Thread.sleep(idx * 80L) } catch (_: Exception) {}
+                    try { Thread.sleep(idx * 60L) } catch (_: Exception) {}
                 }
-                discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
+                validateAndDiscoverKeyOnStartup(k)
             }
         }
 
@@ -152,9 +155,9 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        // Exact 0.60 scale from your working baseline: keeps math exponents, signs, and text 100% clear
-        val width = (metrics.widthPixels * 0.60).toInt()
-        val height = (metrics.heightPixels * 0.60).toInt()
+        // 0.56 scale keeps math symbols (+, -, ÷, exponents) sharp while reducing 3x simultaneous upload time
+        val width = (metrics.widthPixels * 0.56).toInt()
+        val height = (metrics.heightPixels * 0.56).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -174,7 +177,6 @@ class OverlayService : Service() {
                     )
                     fullBitmap.copyPixelsFromBuffer(buffer)
 
-                    // Crops out top 12% (URL bar) and bottom 18% (Nav bar) so only the quiz card is captured
                     val topY = (image.height * 0.12).toInt()
                     val cropH = (image.height * 0.70).toInt()
                     val cropped = Bitmap.createBitmap(fullBitmap, 0, topY, image.width, cropH)
@@ -215,7 +217,6 @@ class OverlayService : Service() {
             y = 110
         }
 
-        // Completely transparent background with your exact 0%-100% slider opacity
         val bgDrawable = GradientDrawable().apply {
             setColor(Color.TRANSPARENT)
             cornerRadius = 36f
@@ -252,8 +253,7 @@ class OverlayService : Service() {
         }
 
         answerText = TextView(this).apply {
-            text = "Ready (${apiKeys.size} keys)"
-            // High-visibility neon green with strong black halo so it reads clearly on BOTH white and black screens
+            text = "Ready (${activeKeys.size} keys)"
             setTextColor(Color.parseColor("#00FF88"))
             setShadowLayer(7f, 0f, 0f, Color.BLACK)
             textSize = 14f
@@ -308,8 +308,8 @@ class OverlayService : Service() {
     }
 
     private fun captureAndAskAI() {
-        if (apiKeys.isEmpty()) {
-            answerText.text = "Add Key in App!"
+        if (activeKeys.isEmpty()) {
+            answerText.text = "No Valid Keys!"
             return
         }
         isScanning = true
@@ -317,7 +317,6 @@ class OverlayService : Service() {
         overlayView.visibility = View.INVISIBLE
         overlayView.invalidate()
 
-        // 45ms guarantees Android's screen compositor pushes a fresh frame without the overlay
         Handler(Looper.getMainLooper()).postDelayed({
             overlayView.visibility = View.VISIBLE
 
@@ -345,16 +344,15 @@ class OverlayService : Service() {
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 62, outputStream)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 60, outputStream)
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
-    /**
-     * Picks the next N healthy (non-cooling-down) keys from your 8-key pool.
-     */
     private fun pickHealthyKeys(desiredCount: Int, exclude: Set<String> = emptySet()): List<String> {
-        val total = apiKeys.size
+        val snapshot = activeKeys.toList()
+        val total = snapshot.size
         if (total == 0) return emptyList()
+
         val now = System.currentTimeMillis()
         val start = keyStepCounter.getAndAdd(desiredCount)
 
@@ -362,7 +360,7 @@ class OverlayService : Service() {
         val cooling = mutableListOf<String>()
 
         for (i in 0 until total) {
-            val k = apiKeys[(start + i) % total]
+            val k = snapshot[(start + i) % total]
             if (exclude.contains(k)) continue
             if (now >= (keyCooldownUntil[k] ?: 0L)) {
                 healthy.add(k)
@@ -375,18 +373,20 @@ class OverlayService : Service() {
 
     /**
      * SIMULTANEOUS 3-KEY MAJORITY VOTING ENGINE:
-     * - Fires 3 healthy keys simultaneously.
-     * - If any key fails (e.g. 429), that worker thread immediately grabs a fresh backup key from your 8 keys!
-     * - Unlocks the instant 2 keys agree (~1.2s), OR within 450ms after the 1st valid answer arrives so a slow 3rd key never causes "Err (Time)"!
+     * - Worker 0: Fast Sprinter (thinkingBudget = 0, answers in ~1.0s)
+     * - Worker 1: Math & Logic Reasoner (thinkingBudget = 48, answers in ~1.4s)
+     * - Worker 2: Trap & Calculation Verifier (thinkingBudget = 48, answers in ~1.5s)
+     * - Unlocks immediately when ANY 2 keys agree (~1.3s), or returns the best valid answer without timing out!
      */
     private fun executeSimultaneousMajorityVote(base64Image: String): String {
-        val total = apiKeys.size
-        if (total == 1) {
-            val singleRes = callGeminiFast(apiKeys[0], base64Image, isVerifier = false)
+        val totalAvailable = activeKeys.size
+        if (totalAvailable == 0) return "Err (No valid key)"
+        if (totalAvailable == 1) {
+            val singleRes = callGeminiFast(activeKeys[0], base64Image, workerRole = 1)
             return if (!singleRes.startsWith("ERR:")) singleRes else "Err (${singleRes.removePrefix("ERR:")})"
         }
 
-        val workerCount = minOf(3, total)
+        val workerCount = minOf(3, totalAvailable)
         val initialKeys = pickHealthyKeys(workerCount)
         val usedKeys = Collections.synchronizedSet(HashSet<String>(initialKeys))
 
@@ -397,27 +397,27 @@ class OverlayService : Service() {
         val lastErr = AtomicReference("Time")
         val decided = AtomicBoolean(false)
         val firstAnswerLatch = CountDownLatch(1)
-        val finalLatch = CountDownLatch(1)
+        val majorityLatch = CountDownLatch(1)
         val remaining = AtomicInteger(workerCount)
 
         for ((idx, startKey) in initialKeys.withIndex()) {
             networkPool.execute {
-                // 35ms stagger prevents 3 simultaneous Base64 uploads from colliding in the mobile socket buffer
+                // 40ms stagger prevents 3 simultaneous uploads from choking the mobile socket
                 if (idx > 0) {
-                    try { Thread.sleep(idx * 35L) } catch (_: Exception) {}
+                    try { Thread.sleep(idx * 40L) } catch (_: Exception) {}
                 }
 
-                var res = callGeminiFast(startKey, base64Image, isVerifier = (idx == 2))
+                var res = callGeminiFast(startKey, base64Image, workerRole = idx)
 
-                // Self-healing failover: if this key failed (e.g. 429) and we have unused keys in our 8-key pool, immediately grab a spare key!
-                if (res.startsWith("ERR:") && !decided.get() && usedKeys.size < total) {
+                // If this key failed quickly (e.g. 401/403/429) and we have spare keys in our 8-key pool, immediately grab one!
+                if (res.startsWith("ERR:") && !decided.get() && usedKeys.size < activeKeys.size) {
                     val spareKey = synchronized(usedKeys) {
                         val candidate = pickHealthyKeys(1, usedKeys).firstOrNull()
                         if (candidate != null) usedKeys.add(candidate)
                         candidate
                     }
-                    if (spareKey != null) {
-                        res = callGeminiFast(spareKey, base64Image, isVerifier = (idx == 2))
+                    if (spareKey != null && !decided.get()) {
+                        res = callGeminiFast(spareKey, base64Image, workerRole = idx)
                     }
                 }
 
@@ -428,15 +428,19 @@ class OverlayService : Service() {
                         val newCount = (voteCounts[voteKey] ?: 0) + 1
                         voteCounts[voteKey] = newCount
 
-                        // Instant 2-of-3 Majority Lock! Unlocks main thread at 0ms wait once 2 keys agree!
+                        // Instant 2-of-3 Majority Lock! Unlocks main thread the exact millisecond 2 keys agree!
                         if (newCount >= 2 && decided.compareAndSet(false, true)) {
                             majorityWinner.set(res)
-                            finalLatch.countDown()
+                            majorityLatch.countDown()
                         }
                     }
                     firstAnswerLatch.countDown()
                 } else {
-                    lastErr.set(res.removePrefix("ERR:"))
+                    val errCode = res.removePrefix("ERR:")
+                    // Only overwrite lastErr if we don't already have a specific HTTP code (like 429/401)
+                    if (errCode != "Time" || lastErr.get() == "Time") {
+                        lastErr.set(errCode)
+                    }
                 }
 
                 if (remaining.decrementAndGet() == 0) {
@@ -446,17 +450,17 @@ class OverlayService : Service() {
                         }
                     }
                     firstAnswerLatch.countDown()
-                    finalLatch.countDown()
+                    majorityLatch.countDown()
                 }
             }
         }
 
-        // Wait up to 3.8s for at least 1 key (or 2-key majority) to answer
-        firstAnswerLatch.await(3800, TimeUnit.MILLISECONDS)
+        // Wait up to 5.5s for the 1st valid answer (or until all workers finish)
+        firstAnswerLatch.await(5500, TimeUnit.MILLISECONDS)
 
-        // If 2 keys haven't locked a majority yet, give the other parallel keys up to 450ms to finish voting
+        // Once the 1st answer is in, give the other 2 parallel reasoner keys up to 1000ms to lock a 2-of-3 majority
         if (!decided.get()) {
-            finalLatch.await(450, TimeUnit.MILLISECONDS)
+            majorityLatch.await(1000, TimeUnit.MILLISECONDS)
         }
 
         val finalChoice = majorityWinner.get() ?: synchronized(voteLock) {
@@ -488,69 +492,94 @@ class OverlayService : Service() {
         return trimmed.replace(Regex("[^A-Z0-9]"), "").take(12)
     }
 
-    private fun discoverGeminiModelOnStartup(key: String): String? {
-        return try {
-            val encodedKey = URLEncoder.encode(key, "UTF-8")
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models?key=$encodedKey")
+    /**
+     * Checks each key on startup:
+     * 1. Finds its best unlocked Flash model on generativelanguage.googleapis.com.
+     * 2. If a key returns 401/403, removes it from activeKeys so it NEVER causes Err (401) during your quiz!
+     */
+    private fun validateAndDiscoverKeyOnStartup(key: String) {
+        try {
+            val url = URL("https://generativelanguage.googleapis.com/v1beta/models")
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 setRequestProperty("x-goog-api-key", key)
-                connectTimeout = 2500
-                readTimeout = 2500
+                connectTimeout = 3500
+                readTimeout = 3500
             }
-            if (conn.responseCode != 200) return null
+            val code = conn.responseCode
+            if (code == 200) {
+                val responseText = conn.inputStream.use { it.bufferedReader().readText() }
+                val json = JSONObject(responseText)
+                val arr = json.getJSONArray("models")
+                val unlocked = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val m = arr.getJSONObject(i)
+                    val name = m.getString("name").removePrefix("models/")
+                    val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
+                    if (methods.contains("generateContent")) unlocked.add(name)
+                }
 
-            val responseText = conn.inputStream.use { it.bufferedReader().readText() }
-            val json = JSONObject(responseText)
-            val arr = json.getJSONArray("models")
-            val unlocked = mutableListOf<String>()
-            for (i in 0 until arr.length()) {
-                val m = arr.getJSONObject(i)
-                val name = m.getString("name").removePrefix("models/")
-                val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
-                if (methods.contains("generateContent")) unlocked.add(name)
+                val preferred = listOf(
+                    "gemini-2.5-flash",
+                    "gemini-3.6-flash",
+                    "gemini-3.7-flash",
+                    "gemini-3.8-flash",
+                    "gemini-2.5-flash-lite",
+                    "gemini-3.5-flash-lite"
+                )
+                for (p in preferred) {
+                    if (unlocked.contains(p)) {
+                        geminiModelCache[key] = p
+                        return
+                    }
+                }
+                unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+                    ?.let { geminiModelCache[key] = it }
+            } else if (code == 401 || code == 403) {
+                conn.errorStream?.use { it.readBytes() }
+                // Key is rejected by generativelanguage.googleapis.com; remove it if other keys exist
+                if (activeKeys.size > 1) {
+                    activeKeys.remove(key)
+                    Handler(Looper.getMainLooper()).post {
+                        if (!isScanning && ::answerText.isInitialized) {
+                            answerText.text = "Ready (${activeKeys.size} ok)"
+                        }
+                    }
+                }
             }
-
-            // Your exact working model list from the Picture-Perfect baseline
-            val preferred = listOf(
-                "gemini-2.5-flash",
-                "gemini-3.6-flash",
-                "gemini-3.8-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-3.5-flash-lite"
-            )
-            for (p in preferred) {
-                if (unlocked.contains(p)) return p
-            }
-            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
-        } catch (e: Exception) {
-            null
+        } catch (_: Exception) {
         }
     }
 
-    private fun callGeminiFast(key: String, base64Image: String, isVerifier: Boolean): String {
+    private fun callGeminiFast(key: String, base64Image: String, workerRole: Int): String {
         val model = geminiModelCache[key] ?: "gemini-2.5-flash"
-        val allowThinking = !noThinkingModels.contains(model)
+        val allowThinking = !noThinkingModels.contains(model) && (workerRole > 0)
 
-        var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking, isVerifier = isVerifier)
+        var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking, workerRole = workerRole)
 
         if (res == "ERR:400" && allowThinking) {
             noThinkingModels.add(model)
-            res = sendGeminiHttp(key, model, base64Image, includeThinking = false, isVerifier = isVerifier)
+            res = sendGeminiHttp(key, model, base64Image, includeThinking = false, workerRole = workerRole)
         } else if (res == "ERR:404") {
-            // Exact working fallback from your Picture-Perfect baseline so it never 404s
             val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
-            res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false, isVerifier = isVerifier)
+            res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false, workerRole = workerRole)
+        } else if (res == "ERR:401" && !vertexEndpointKeys.contains(key)) {
+            // If an AQ. key returned 401 on generativelanguage, try Vertex Express endpoint once
+            vertexEndpointKeys.add(key)
+            res = sendGeminiHttp(key, "gemini-2.5-flash", base64Image, includeThinking = false, workerRole = workerRole)
         }
 
         if (res.startsWith("ERR:")) {
             val code = res.removePrefix("ERR:")
             if (code == "429") {
-                // Cool down this key for 22 seconds so the other 7 keys take over seamlessly
                 keyCooldownUntil[key] = System.currentTimeMillis() + 22_000L
-            } else if (code == "403" || code == "401") {
-                keyCooldownUntil[key] = System.currentTimeMillis() + 300_000L
+            } else if (code == "401" || code == "403") {
+                // Permanently remove broken 401/403 key from active rotation so it never causes an error again!
+                keyCooldownUntil[key] = System.currentTimeMillis() + 600_000L
+                if (activeKeys.size > 1) {
+                    activeKeys.remove(key)
+                }
             }
         }
         return res
@@ -561,22 +590,29 @@ class OverlayService : Service() {
         modelName: String,
         base64Image: String,
         includeThinking: Boolean,
-        isVerifier: Boolean
+        workerRole: Int
     ): String {
         return try {
-            val encodedKey = URLEncoder.encode(key, "UTF-8")
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent?key=$encodedKey")
+            val endpointUrl = if (vertexEndpointKeys.contains(key)) {
+                "https://aiplatform.googleapis.com/v1/publishers/google/models/$modelName:generateContent"
+            } else {
+                "https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent"
+            }
+
+            val url = URL(endpointUrl)
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 setRequestProperty("Content-Type", "application/json")
+                // Single clean authentication header (no duplicate ?key= query param)
                 setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
-                connectTimeout = 2600
-                readTimeout = 2800
+                connectTimeout = 3000
+                // 5200ms readTimeout prevents premature "Err (Time)" cutoffs when 3 images upload simultaneously
+                readTimeout = 5200
                 doOutput = true
             }
 
-            val prompt = if (isVerifier) {
+            val prompt = if (workerRole == 2) {
                 "CRITICAL MATH & LOGIC VERIFIER: Solve any math calculation step-by-step internally, and check for ANTONYM vs SYNONYM or NOT/EXCEPT traps. Verify all options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise' or 'C) 24'). NO explanation. Max 4 words."
             } else {
                 "Pay strict attention to whether the question asks for SYNONYM, ANTONYM, Grammar, or Math calculation. Double-check the options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise' or 'C) 24'). NO explanation. Max 4 words."
@@ -592,11 +628,14 @@ class OverlayService : Service() {
             }
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
-            // Exact generationConfig from your Picture-Perfect baseline (thinkingBudget: 64 + maxOutputTokens: 120)
             val genConfig = JSONObject().apply {
                 put("maxOutputTokens", 120)
                 if (includeThinking) {
-                    put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
+                    // Worker 1 & 2 use 48 thinking tokens for math/logic accuracy
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 48))
+                } else if (!noThinkingModels.contains(modelName) && modelName.contains("2.5")) {
+                    // Worker 0 explicitly sets thinkingBudget = 0 so it sprints in ~1.0s instead of defaulting to 8192 dynamic thinking!
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                 }
             }
 
@@ -631,8 +670,10 @@ class OverlayService : Service() {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
             }
-        } catch (e: Exception) {
+        } catch (e: SocketTimeoutException) {
             "ERR:Time"
+        } catch (e: Exception) {
+            "ERR:Net"
         }
     }
 
