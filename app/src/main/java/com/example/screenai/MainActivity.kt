@@ -34,13 +34,11 @@ class MainActivity : AppCompatActivity() {
                 keyInput4.text.toString().trim()
             ).filter { it.length > 12 }.joinToString(",")
 
-            val chosenOpacity = opacitySeekBar.progress
-
             val serviceIntent = Intent(this, OverlayService::class.java).apply {
                 putExtra("RESULT_CODE", result.resultCode)
                 putExtra("DATA", result.data)
                 putExtra("API_KEY", combinedKeys)
-                putExtra("OPACITY_PERCENT", chosenOpacity)
+                putExtra("OPACITY_PERCENT", opacitySeekBar.progress)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent)
@@ -70,7 +68,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (Gemini + Groq Engine)"
+            text = "Quiz Solver AI (Gemini + Groq Engine)"
             textSize = 20f
             setTextColor(Color.BLACK)
             setPadding(0, 0, 0, 14)
@@ -83,13 +81,13 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, 28)
         }
 
-        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 65)
+        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 80)
 
         opacityLabel = TextView(this).apply {
             text = "Overlay Opacity: $savedOpacity%"
             textSize = 15f
             setTextColor(Color.BLACK)
-            setPadding(0, 10, 0, 8)
+            setPadding(0, 0, 0, 8)
         }
 
         opacitySeekBar = SeekBar(this).apply {
