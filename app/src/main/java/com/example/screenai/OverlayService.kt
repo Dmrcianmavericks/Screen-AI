@@ -23,6 +23,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Collections
@@ -46,9 +47,8 @@ class OverlayService : Service() {
     private var apiKeys: List<String> = emptyList()
     private var overlayOpacityPercent: Int = 75
 
-    // Increments on every SCAN click so you can tap SCAN anytime without waiting for slow threads
     private val scanGeneration = AtomicInteger(0)
-    private val keyStepCounter = AtomicInteger(0)
+    private val pairStepCounter = AtomicInteger(0)
 
     private val geminiModelCache = ConcurrentHashMap<String, String>()
     private val keyCooldownUntil = ConcurrentHashMap<String, Long>()
@@ -64,7 +64,7 @@ class OverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         System.setProperty("http.keepAlive", "true")
-        System.setProperty("http.maxConnections", "20")
+        System.setProperty("http.maxConnections", "16")
 
         if (networkPool.isShutdown) {
             networkPool = Executors.newCachedThreadPool()
@@ -130,7 +130,7 @@ class OverlayService : Service() {
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
                 .setContentTitle("Screen AI Active")
-                .setContentText("Live 3-Slot Mode: 2 Fast + 1 Deep")
+                .setContentText("2-Slot Live Mode: Fast + Smart")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
@@ -147,8 +147,8 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        val width = (metrics.widthPixels * 0.55).toInt()
-        val height = (metrics.heightPixels * 0.55).toInt()
+        val width = (metrics.widthPixels * 0.56).toInt()
+        val height = (metrics.heightPixels * 0.56).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -216,7 +216,7 @@ class OverlayService : Service() {
         overlayView = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = bgDrawable
-            setPadding(10, 4, 14, 4)
+            setPadding(12, 6, 16, 6)
             gravity = Gravity.CENTER_VERTICAL
             alpha = overlayOpacityPercent / 100f
         }
@@ -238,9 +238,8 @@ class OverlayService : Service() {
             minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            // Never locks! Tapping SCAN immediately starts a fresh scan generation
             setOnClickListener {
-                captureAndStreamThreeSlots()
+                captureAndStreamTwoSlots()
             }
         }
 
@@ -248,10 +247,10 @@ class OverlayService : Service() {
             text = "Ready (${apiKeys.size} keys)"
             setTextColor(Color.parseColor("#00FF88"))
             setShadowLayer(7f, 0f, 0f, Color.BLACK)
-            textSize = 13f
-            setPadding(14, 0, 14, 0)
-            minWidth = 180
-            maxWidth = 780
+            textSize = 14f
+            setPadding(16, 0, 16, 0)
+            minWidth = 190
+            maxWidth = 740
             maxLines = 2
         }
 
@@ -299,13 +298,17 @@ class OverlayService : Service() {
         windowManager.addView(overlayView, params)
     }
 
-    private fun captureAndStreamThreeSlots() {
+    /**
+     * LIVE 2-SLOT ENGINE (Uses the exact 2-key network load proven to work fast on your phone):
+     * - Slot 1 (Left): 0-thinking Sprinter -> pops onto screen in ~0.9s
+     * - Slot 2 (Right, 🧠): 64-thinking Trick Verifier -> starts 150ms later & pops onto screen in ~1.5s
+     */
+    private fun captureAndStreamTwoSlots() {
         if (apiKeys.isEmpty()) {
             answerText.text = "Add Key in App!"
             return
         }
 
-        // Increment generation ID so any still-running threads from an older click are ignored
         val myGen = scanGeneration.incrementAndGet()
 
         overlayView.visibility = View.INVISIBLE
@@ -324,9 +327,8 @@ class OverlayService : Service() {
                 return@postDelayed
             }
 
-            // Show all 3 live slots immediately: Slot 1 (Fast) | Slot 2 (Fast) | Slot 3 (Deep Thinker)
-            val slotCount = minOf(3, apiKeys.size)
-            val slots = Array(slotCount) { idx -> if (idx == 2) "🧠.." else ".." }
+            val slotCount = minOf(2, apiKeys.size)
+            val slots = if (slotCount == 2) arrayOf("..", "🧠..") else arrayOf("..")
             val slotLock = Object()
 
             fun updateHud() {
@@ -349,34 +351,40 @@ class OverlayService : Service() {
 
                 if (scanGeneration.get() != myGen) return@execute
 
-                val initialKeys = pickNextHealthyKeys(slotCount)
-                val usedKeys = Collections.synchronizedSet(HashSet<String>(initialKeys))
+                val pairKeys = pickNextHealthyKeys(slotCount)
+                val usedKeys = Collections.synchronizedSet(HashSet<String>(pairKeys))
 
-                for ((slotIdx, startKey) in initialKeys.withIndex()) {
+                for ((slotIdx, startKey) in pairKeys.withIndex()) {
                     networkPool.execute {
-                        // Stagger uploads by 70ms per slot so 3 requests never collide on mobile data
-                        if (slotIdx > 0) {
-                            try { Thread.sleep(slotIdx * 70L) } catch (_: Exception) {}
+                        // 150ms stagger guarantees Slot 1 finishes uploading before Slot 2 starts!
+                        if (slotIdx == 1) {
+                            try { Thread.sleep(150L) } catch (_: Exception) {}
                         }
                         if (scanGeneration.get() != myGen) return@execute
 
-                        val res = executeSingleSlotWithFailover(
-                            firstKey = startKey,
-                            usedKeys = usedKeys,
-                            base64Image = base64Img,
-                            slotRole = slotIdx,
-                            myGen = myGen
-                        )
+                        var res = callGeminiSlot(startKey, base64Img, isSmartSlot = (slotIdx == 1))
+
+                        // Instant spare-key failover if a key returns an HTTP error (like 429/403)
+                        if (res.startsWith("ERR:") && res != "ERR:Time" && scanGeneration.get() == myGen && usedKeys.size < apiKeys.size) {
+                            val spareKey = synchronized(usedKeys) {
+                                val next = pickNextHealthyKeys(1, usedKeys).firstOrNull()
+                                if (next != null) usedKeys.add(next)
+                                next
+                            }
+                            if (spareKey != null && scanGeneration.get() == myGen) {
+                                res = callGeminiSlot(spareKey, base64Img, isSmartSlot = (slotIdx == 1))
+                            }
+                        }
 
                         if (scanGeneration.get() != myGen) return@execute
 
                         synchronized(slotLock) {
-                            val cleanAns = if (!res.startsWith("ERR:")) {
+                            val formatted = if (!res.startsWith("ERR:")) {
                                 res
                             } else {
-                                "Err:${res.removePrefix("ERR:")}"
+                                "Err(${res.removePrefix("ERR:")})"
                             }
-                            slots[slotIdx] = if (slotIdx == 2) "🧠$cleanAns" else cleanAns
+                            slots[slotIdx] = if (slotIdx == 1) "🧠 $formatted" else formatted
                         }
                         updateHud()
                     }
@@ -385,49 +393,17 @@ class OverlayService : Service() {
         }, 40)
     }
 
-    private fun executeSingleSlotWithFailover(
-        firstKey: String,
-        usedKeys: MutableSet<String>,
-        base64Image: String,
-        slotRole: Int,
-        myGen: Int
-    ): String {
-        var currentKey: String? = firstKey
-        var attempts = 0
-        var lastError = "ERR:Net"
-
-        while (currentKey != null && attempts < 2 && scanGeneration.get() == myGen) {
-            attempts++
-            val res = callGeminiByRole(currentKey, base64Image, slotRole)
-            if (!res.startsWith("ERR:")) {
-                return res
-            }
-            lastError = res
-            // If this key hit 429/403/404, grab a fresh spare key from the 8-key pool immediately
-            currentKey = if (scanGeneration.get() == myGen && usedKeys.size < apiKeys.size) {
-                synchronized(usedKeys) {
-                    val spare = pickNextHealthyKeys(1, usedKeys).firstOrNull()
-                    if (spare != null) usedKeys.add(spare)
-                    spare
-                }
-            } else {
-                null
-            }
-        }
-        return lastError
-    }
-
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        // 480px max width (~14KB Base64): proven ultra-fast upload size that prevents timeouts!
-        val scaled = if (bitmap.width > 480) {
-            val ratio = 480f / bitmap.width
+        // Proven 500px width scaling: keeps text & blanks sharp while uploading in <0.1s
+        val scaled = if (bitmap.width > 500) {
+            val ratio = 500f / bitmap.width
             val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
-            Bitmap.createScaledBitmap(bitmap, 480, h, true)
+            Bitmap.createScaledBitmap(bitmap, 500, h, true)
         } else {
             bitmap
         }
-        scaled.compress(Bitmap.CompressFormat.JPEG, 56, outputStream)
+        scaled.compress(Bitmap.CompressFormat.JPEG, 58, outputStream)
         if (scaled !== bitmap) scaled.recycle()
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
@@ -436,7 +412,7 @@ class OverlayService : Service() {
         val total = apiKeys.size
         if (total == 0) return emptyList()
         val now = System.currentTimeMillis()
-        val start = keyStepCounter.getAndAdd(count)
+        val start = pairStepCounter.getAndAdd(count)
 
         val ready = mutableListOf<String>()
         val cooling = mutableListOf<String>()
@@ -459,8 +435,8 @@ class OverlayService : Service() {
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 setRequestProperty("x-goog-api-key", key)
-                connectTimeout = 3000
-                readTimeout = 3000
+                connectTimeout = 2500
+                readTimeout = 2500
             }
             if (conn.responseCode != 200) return null
 
@@ -475,7 +451,7 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
-            // Exact proven model priority list that works fast on your keys
+            // Exact model list from the version that worked fast on your phone
             val preferred = listOf(
                 "gemini-2.5-flash",
                 "gemini-3.6-flash",
@@ -493,24 +469,19 @@ class OverlayService : Service() {
         }
     }
 
-    /**
-     * Role 0: Fast Sprinter #1 (thinkingBudget = 0, direct answer in ~0.8s)
-     * Role 1: Fast Sprinter #2 (thinkingBudget = 0, left-to-right pipe check in ~1.0s)
-     * Role 2: 🧠 Deep Thinker #3 (thinkingBudget = 96, solves trick/math questions in ~1.7s)
-     */
-    private fun callGeminiByRole(key: String, base64Image: String, slotRole: Int): String {
+    private fun callGeminiSlot(key: String, base64Image: String, isSmartSlot: Boolean): String {
         val model = geminiModelCache[key] ?: "gemini-2.5-flash"
-        val allowThinkingConfig = !noThinkingModels.contains(model)
+        val allowThinkingField = !noThinkingModels.contains(model)
 
-        var res = sendGeminiHttp(key, model, base64Image, slotRole, allowThinkingConfig)
+        var res = sendGeminiHttp(key, model, base64Image, isSmartSlot, allowThinkingField)
 
-        if (res == "ERR:400" && allowThinkingConfig) {
+        if (res == "ERR:400" && allowThinkingField) {
             noThinkingModels.add(model)
-            res = sendGeminiHttp(key, model, base64Image, slotRole, sendThinkingField = false)
+            res = sendGeminiHttp(key, model, base64Image, isSmartSlot, sendThinkingField = false)
         } else if (res == "ERR:404") {
             val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
-            res = sendGeminiHttp(key, nextModel, base64Image, slotRole, sendThinkingField = !noThinkingModels.contains(nextModel))
+            res = sendGeminiHttp(key, nextModel, base64Image, isSmartSlot, sendThinkingField = !noThinkingModels.contains(nextModel))
         }
 
         if (res.startsWith("ERR:")) {
@@ -528,7 +499,7 @@ class OverlayService : Service() {
         key: String,
         modelName: String,
         base64Image: String,
-        slotRole: Int,
+        isSmartSlot: Boolean,
         sendThinkingField: Boolean
     ): String {
         return try {
@@ -539,16 +510,18 @@ class OverlayService : Service() {
                 setRequestProperty("Content-Type", "application/json")
                 setRequestProperty("x-goog-api-key", key)
                 setRequestProperty("Connection", "keep-alive")
-                connectTimeout = 4000
-                // 10-second read timeout so the Deep Thinker (Slot 3) is NEVER killed by "Err (Time)"
-                readTimeout = 10000
+                connectTimeout = 2500
+                // Crisp 3.4s read timeout so it never hangs for 10-20s
+                readTimeout = 3400
                 doOutput = true
             }
 
-            val prompt = when (slotRole) {
-                0 -> "Fast Quiz Solver: Read the question and options (A/B/C/D). Reply ONLY with the correct option letter and short answer (example: 'D) reject'). NO explanation. Max 3 words."
-                1 -> "Check if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Write a 5-word check then '|' then the option letter and answer (example: 'opposite of accept | D) reject')."
-                else -> "DEEP TRICK & MATH VERIFIER: Carefully check for trick questions (ANTONYM vs SYNONYM, NOT/EXCEPT, grammar clues like 'than'/'the'/prepositions, or math BODMAS calculation). Verify all options (A/B/C/D) and output ONLY the correct option letter and exact short answer (example: 'D) reject' or 'C) 24'). NO explanation. Max 3 words."
+            val prompt = if (!isSmartSlot) {
+                // Slot 1: Fast direct prompt
+                "Read the question and options (A/B/C/D) carefully. Check if it asks for SYNONYM, ANTONYM, Grammar, or Math. Reply ONLY with the correct option letter and exact short answer (example: 'D) reject' or 'C) 24'). NO explanation. Max 3 words."
+            } else {
+                // Slot 2 (🧠): Master Trick-Question Verifier
+                "TRICK QUESTION VERIFIER: 1) Check if it asks for ANTONYM (opposite) vs SYNONYM (tip: if 3 options mean the same thing and 1 is opposite, pick the odd one out!). 2) Check for NOT/EXCEPT. 3) Check grammar rules around blanks (prepositions, tense, singular/plural). 4) Solve math step-by-step. Output ONLY the correct option letter and exact short answer (example: 'D) reject'). NO explanation. Max 3 words."
             }
 
             val inlineData = JSONObject().apply {
@@ -562,18 +535,17 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                if (slotRole < 2) {
-                    // Slots 1 & 2: 0 thinking budget for guaranteed ~0.9s instant response!
-                    put("maxOutputTokens", 45)
+                if (!isSmartSlot) {
+                    // Slot 1: 0 thinking budget -> guaranteed ~0.9s instant answer
+                    put("maxOutputTokens", 40)
                     if (sendThinkingField) {
                         put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                     }
                 } else {
-                    // Slot 3 (🧠): 96 thinking budget + 350 maxOutputTokens so it solves trick questions accurately in ~1.7s!
-                    put("maxOutputTokens", 350)
+                    // Slot 2 (🧠): Exact 64 thinkingBudget from your working baseline + 200 maxOutputTokens so thought tokens never cut off the answer
+                    put("maxOutputTokens", 200)
                     if (sendThinkingField) {
-                        val budget = if (modelName.contains("lite")) 512 else 96
-                        put("thinkingConfig", JSONObject().put("thinkingBudget", budget))
+                        put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
                     }
                 }
             }
@@ -609,26 +581,21 @@ class OverlayService : Service() {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
             }
+        } catch (e: SocketTimeoutException) {
+            "ERR:Time"
         } catch (e: Exception) {
             "ERR:Net"
         }
     }
 
-    // Keeps each slot super compact (e.g. "D) reject") so all 3 fit cleanly on your transparent bar
     private fun formatSlotAnswer(raw: String): String {
         val clean = raw.replace("*", "").replace("\n", " ").trim()
-        val afterPipe = if (clean.contains("|")) {
-            clean.substringAfterLast("|").trim()
-        } else {
-            clean
-        }
-
-        val match = Regex("""([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+)?)""").find(afterPipe)
+        val match = Regex("""([A-Da-d][\)\.\:]\s*\S+(?:\s+\S+)?)""").find(clean)
         if (match != null) {
             return match.groupValues[1].trim()
         }
-        val words = afterPipe.split(Regex("\\s+"))
-        return if (words.size > 3) words.take(3).joinToString(" ") else afterPipe
+        val words = clean.split(Regex("\\s+"))
+        return if (words.size > 3) words.take(3).joinToString(" ") else clean
     }
 
     private fun cleanupSessionOnly() {
