@@ -47,10 +47,11 @@ class OverlayService : Service() {
     private var latestBitmap: Bitmap? = null
 
     private var apiKeys: List<String> = emptyList()
+    private var overlayOpacityPercent: Int = 65
+
     // Strictly steps by 2: Scan 1 -> [0, 1] (Key 1 & 2), Scan 2 -> [2, 3] (Key 3 & 4), Scan 3 -> [0, 1] (Key 1 & 2)
     private val pairStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
-    private val groqModelCache = ConcurrentHashMap<String, String>()
     private val noThinkingModels = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     // Pre-allocated thread pool so Android never wastes time creating new OS threads on each click
@@ -81,6 +82,8 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
+        overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 65).coerceIn(0, 100)
+
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
         apiKeys = rawKeys.split(",", "\n", " ")
             .map { it.trim() }
@@ -102,12 +105,10 @@ class OverlayService : Service() {
         setupScreenReader()
         setupFloatingOverlay()
 
-        // Pre-discover the best unlocked model for BOTH Gemini keys AND Groq (gsk_) keys on startup!
+        // Pre-discover the best unlocked Gemini model for each key in the background on startup ONLY
         for (k in apiKeys) {
-            networkPool.execute {
-                if (k.startsWith("gsk_")) {
-                    discoverGroqModelOnStartup(k)?.let { groqModelCache[k] = it }
-                } else {
+            if (!k.startsWith("gsk_")) {
+                networkPool.execute {
                     discoverGeminiModelOnStartup(k)?.let { geminiModelCache[k] = it }
                 }
             }
@@ -142,9 +143,8 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        // 68% scale keeps math signs (+, -, ÷, exponents) and punctuation sharp so AI doesn't misread after 10+ scans
-        val width = (metrics.widthPixels * 0.68).toInt()
-        val height = (metrics.heightPixels * 0.68).toInt()
+        val width = (metrics.widthPixels * 0.60).toInt()
+        val height = (metrics.heightPixels * 0.60).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -206,7 +206,7 @@ class OverlayService : Service() {
         }
 
         val bgDrawable = GradientDrawable().apply {
-            setColor(Color.parseColor("#E6000000"))
+            setColor(Color.TRANSPARENT)
             cornerRadius = 36f
         }
 
@@ -215,6 +215,7 @@ class OverlayService : Service() {
             background = bgDrawable
             setPadding(18, 10, 22, 10)
             gravity = Gravity.CENTER_VERTICAL
+            alpha = overlayOpacityPercent / 100f
         }
 
         val scanButton = Button(this).apply {
@@ -228,6 +229,7 @@ class OverlayService : Service() {
 
         answerText = TextView(this).apply {
             text = "Ready (${apiKeys.size} keys)"
+            setBackgroundColor(Color.TRANSPARENT)
             setTextColor(Color.parseColor("#00FF88"))
             textSize = 14f
             setPadding(20, 0, 20, 0)
@@ -289,7 +291,7 @@ class OverlayService : Service() {
         overlayView.visibility = View.INVISIBLE
         overlayView.invalidate()
 
-        // 50ms guarantees Android's screen compositor pushes a fresh frame of the new question
+        // 45ms guarantees Android's screen compositor pushes a fresh frame without the overlay
         Handler(Looper.getMainLooper()).postDelayed({
             overlayView.visibility = View.VISIBLE
 
@@ -312,12 +314,12 @@ class OverlayService : Service() {
                     isScanning = false
                 }
             }
-        }, 50)
+        }, 45)
     }
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 70, outputStream)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 62, outputStream)
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -333,6 +335,10 @@ class OverlayService : Service() {
             return if (!singleRes.startsWith("ERR:")) singleRes else "Err (${singleRes.removePrefix("ERR:")})"
         }
 
+        // Steps by 2 on every scan:
+        // Click 1 -> offset 0 -> Key 1 & Key 2
+        // Click 2 -> offset 2 -> Key 3 & Key 4
+        // Click 3 -> offset 4 -> Key 1 & Key 2
         val offset = pairStepCounter.getAndAdd(2)
         val keyA = apiKeys[offset % total]
         val keyB = apiKeys[(offset + 1) % total]
@@ -342,6 +348,7 @@ class OverlayService : Service() {
             return firstPairAnswer
         }
 
+        // If we have 3 or 4 keys and BOTH keys in Pair 1 failed (e.g., 429), immediately fire Pair 2!
         if (total >= 3) {
             val keyC = apiKeys[(offset + 2) % total]
             val keyD = apiKeys[(offset + 3) % total]
@@ -373,7 +380,7 @@ class OverlayService : Service() {
                 if (!res.startsWith("ERR:")) {
                     if (solved.compareAndSet(false, true)) {
                         winner.set(res)
-                        latch.countDown()
+                        latch.countDown() // Unlocks main waiting thread the exact millisecond the fastest key finishes!
                     }
                 } else {
                     lastErr.set(res.removePrefix("ERR:"))
@@ -384,6 +391,7 @@ class OverlayService : Service() {
             }
         }
 
+        // Waits at most 3.8 seconds for the faster of the two simultaneous keys
         latch.await(3800, TimeUnit.MILLISECONDS)
         return winner.get() ?: "ERR:${lastErr.get()}"
     }
@@ -396,68 +404,7 @@ class OverlayService : Service() {
         }
     }
 
-    // Auto-discovers the exact Vision model enabled on your Groq account so it NEVER throws 404!
-    private fun discoverGroqModelOnStartup(groqKey: String): String? {
-        return try {
-            val url = URL("https://api.groq.com/openai/v1/models")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                setRequestProperty("Authorization", "Bearer $groqKey")
-                connectTimeout = 2500
-                readTimeout = 2500
-            }
-            if (conn.responseCode != 200) return null
-
-            val responseText = conn.inputStream.use { it.bufferedReader().readText() }
-            val data = JSONObject(responseText).getJSONArray("data")
-            val available = mutableListOf<String>()
-            for (i in 0 until data.length()) {
-                available.add(data.getJSONObject(i).getString("id"))
-            }
-
-            // Priority list of Groq multimodal vision models
-            val preferredGroqVision = listOf(
-                "meta-llama/llama-4-maverick-17b-128e-instruct",
-                "meta-llama/llama-4-scout-17b-16e-instruct",
-                "llama-3.2-90b-vision-preview",
-                "llama-3.2-11b-vision-preview",
-                "llama-3.2-90b-vision",
-                "llama-3.2-11b-vision"
-            )
-            for (pref in preferredGroqVision) {
-                if (available.contains(pref)) return pref
-            }
-            available.firstOrNull { it.contains("vision") || it.contains("llama-4") }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
     private fun callGroqFast(groqKey: String, base64Image: String): String {
-        val primaryModel = groqModelCache[groqKey] ?: "meta-llama/llama-4-scout-17b-16e-instruct"
-        val modelsToTry = listOf(
-            primaryModel,
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "meta-llama/llama-4-maverick-17b-128e-instruct",
-            "llama-3.2-90b-vision-preview",
-            "llama-3.2-11b-vision-preview"
-        ).distinct()
-
-        var lastCode = "404"
-        for (model in modelsToTry) {
-            val res = sendGroqHttp(groqKey, model, base64Image)
-            if (!res.startsWith("ERR:")) {
-                groqModelCache[groqKey] = model // Lock in the working Groq vision model!
-                return res
-            }
-            lastCode = res.removePrefix("ERR:")
-            // Only keep trying next model if it was 404/400 (model name issue); if 401/429 stop immediately
-            if (lastCode != "404" && lastCode != "400") break
-        }
-        return "ERR:$lastCode"
-    }
-
-    private fun sendGroqHttp(groqKey: String, modelName: String, base64Image: String): String {
         return try {
             val url = URL("https://api.groq.com/openai/v1/chat/completions")
             val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -470,7 +417,7 @@ class OverlayService : Service() {
                 doOutput = true
             }
 
-            val prompt = "Check carefully if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it accurately and output ONLY the correct option letter and exact word/number (example: 'B) precise'). NO explanation. Max 4 words."
+            val prompt = "Check carefully if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it and reply ONLY with the correct option letter and exact word/number (example: 'B) precise'). Max 4 words."
 
             val contentArr = JSONArray().apply {
                 put(JSONObject().apply {
@@ -489,10 +436,10 @@ class OverlayService : Service() {
             })
 
             val payload = JSONObject().apply {
-                put("model", modelName)
+                put("model", "meta-llama/llama-4-maverick-17b-128e-instruct")
                 put("messages", messages)
                 put("temperature", 0.0)
-                put("max_tokens", 25)
+                put("max_tokens", 30)
             }
 
             conn.outputStream.use { it.write(payload.toString().toByteArray()) }
@@ -506,7 +453,9 @@ class OverlayService : Service() {
                     .getJSONObject("message")
                     .getString("content")
                     .trim()
-                if (text.isNotEmpty()) cleanShortAnswer(text) else "ERR:Empty"
+                    .replace("\n", " ")
+                    .replace("*", "")
+                if (text.isNotEmpty()) text else "ERR:Empty"
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
@@ -539,26 +488,23 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
-            // Strictly prioritize full Flash models (smartest at Math & English) over "-lite" models!
             val preferred = listOf(
                 "gemini-2.5-flash",
                 "gemini-3.6-flash",
                 "gemini-3.8-flash",
-                "gemini-3.5-flash",
-                "gemini-2.0-flash",
                 "gemini-2.5-flash-lite",
                 "gemini-3.5-flash-lite"
             )
             for (p in preferred) {
                 if (unlocked.contains(p)) return p
             }
-            unlocked.firstOrNull { it.contains("flash") && !it.contains("lite") && !it.contains("tts") && !it.contains("image") }
-                ?: unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
         } catch (e: Exception) {
             null
         }
     }
 
+    // Never blocks on GET /models during a live quiz scan!
     private fun callGeminiFast(key: String, base64Image: String): String {
         val model = geminiModelCache[key] ?: "gemini-2.5-flash"
         val allowThinking = !noThinkingModels.contains(model)
@@ -569,8 +515,7 @@ class OverlayService : Service() {
             noThinkingModels.add(model)
             res = sendGeminiHttp(key, model, base64Image, includeThinking = false)
         } else if (res == "ERR:404") {
-            // Fall back to full Flash model first so intelligence never drops after 10-12 scans!
-            val nextModel = if (model == "gemini-2.5-flash") "gemini-2.0-flash" else "gemini-2.5-flash"
+            val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
             geminiModelCache[key] = nextModel
             res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false)
         }
@@ -591,7 +536,7 @@ class OverlayService : Service() {
                 doOutput = true
             }
 
-            val prompt = "Read the question and options (A, B, C, D) carefully. Verify if it asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it and output ONLY the correct option letter and exact answer (example: 'B) precise'). NO explanation."
+            val prompt = "Pay strict attention to whether the question asks for SYNONYM, ANTONYM, Grammar, or Math calculation. Double-check the options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -604,11 +549,9 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                put("temperature", 0.0) // Zero randomness so it never guesses wrong after 10+ questions!
-                put("maxOutputTokens", 180) // 128 budget for internal thinking + 52 for final text
+                put("maxOutputTokens", 120)
                 if (includeThinking) {
-                    // 128 thinking tokens (~0.25s) prevents silly math and antonym/synonym mistakes
-                    put("thinkingConfig", JSONObject().put("thinkingBudget", 128))
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
                 }
             }
 
@@ -638,25 +581,13 @@ class OverlayService : Service() {
                     }
                 }
 
-                if (finalAnswer.isEmpty()) "ERR:Empty" else cleanShortAnswer(finalAnswer)
+                if (finalAnswer.isEmpty()) "ERR:Empty" else finalAnswer.replace("\n", " ").replace("*", "")
             } else {
                 conn.errorStream?.use { it.readBytes() }
                 "ERR:$code"
             }
         } catch (e: Exception) {
             "ERR:Time"
-        }
-    }
-
-    // Strips any accidental AI explanation and extracts just the option + answer (e.g. "B) precise")
-    private fun cleanShortAnswer(raw: String): String {
-        val singleLine = raw.replace("*", "").replace("\n", " ").trim()
-        // If AI wrote a long explanation containing "B) precise", extract just the option and answer
-        val words = singleLine.split(Regex("\\s+"))
-        return if (words.size > 6) {
-            words.take(5).joinToString(" ")
-        } else {
-            singleLine
         }
     }
 
