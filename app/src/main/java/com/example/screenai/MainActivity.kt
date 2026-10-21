@@ -15,7 +15,10 @@ import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
-    private val keyInputs = mutableListOf<EditText>()
+    private lateinit var keyInput1: EditText
+    private lateinit var keyInput2: EditText
+    private lateinit var keyInput3: EditText
+    private lateinit var keyInput4: EditText
     private lateinit var opacitySeekBar: SeekBar
     private lateinit var opacityLabel: TextView
     private lateinit var projectionManager: MediaProjectionManager
@@ -24,10 +27,12 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            val combinedKeys = keyInputs
-                .map { it.text.toString().trim() }
-                .filter { it.length > 12 }
-                .joinToString(",")
+            val combinedKeys = listOf(
+                keyInput1.text.toString().trim(),
+                keyInput2.text.toString().trim(),
+                keyInput3.text.toString().trim(),
+                keyInput4.text.toString().trim()
+            ).filter { it.length > 12 }.joinToString(",")
 
             val chosenOpacity = opacitySeekBar.progress
 
@@ -60,31 +65,28 @@ class MainActivity : AppCompatActivity() {
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(60, 140, 60, 80)
+            setPadding(60, 200, 60, 80)
             setBackgroundColor(Color.WHITE)
         }
 
         val title = TextView(this).apply {
-            text = "ScreenAI (Ultra-Fast 8-Key Engine)"
+            text = "ScreenAI (Gemini + Groq Engine)"
             textSize = 20f
             setTextColor(Color.BLACK)
-            setPadding(0, 0, 0, 12)
+            setPadding(0, 0, 0, 14)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Paste 2 to 8 Gemini keys below. Uses 0-thinking instant mode for ~1.0s responses."
+            text = "Supports Gemini (AQ. / AIza) AND Groq (gsk_) keys in any box! Mix or match up to 4 keys. Never paste keys on GitHub."
             textSize = 13f
             setTextColor(Color.DKGRAY)
-            setPadding(0, 0, 0, 24)
+            setPadding(0, 0, 0, 28)
         }
 
-        layout.addView(title)
-        layout.addView(subtitle)
-
-        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 75)
+        val savedOpacity = prefs.getInt("OVERLAY_OPACITY", 65)
 
         opacityLabel = TextView(this).apply {
-            text = "Stealth Overlay Opacity: $savedOpacity%"
+            text = "Overlay Opacity: $savedOpacity%"
             textSize = 15f
             setTextColor(Color.BLACK)
             setPadding(0, 10, 0, 8)
@@ -96,39 +98,38 @@ class MainActivity : AppCompatActivity() {
             setPadding(10, 10, 10, 28)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                    opacityLabel.text = "Stealth Overlay Opacity: $progress%"
+                    opacityLabel.text = "Overlay Opacity: $progress%"
                 }
                 override fun onStartTrackingTouch(seekBar: SeekBar?) {}
                 override fun onStopTrackingTouch(seekBar: SeekBar?) {}
             })
         }
 
-        layout.addView(opacityLabel)
-        layout.addView(opacitySeekBar)
-
-        keyInputs.clear()
-        for (i in 1..8) {
-            val savedKey = prefs.getString("SAFE_KEY_$i", "") ?: ""
-            val box = createKeyBox("Key $i (AQ. / AIza)", savedKey)
-            keyInputs.add(box)
-            layout.addView(box)
-        }
+        keyInput1 = createKeyBox("Key 1 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_1", "") ?: "")
+        keyInput2 = createKeyBox("Key 2 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_2", "") ?: "")
+        keyInput3 = createKeyBox("Key 3 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_3", "") ?: "")
+        keyInput4 = createKeyBox("Key 4 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_4", "") ?: "")
 
         val startBtn = Button(this).apply {
             text = "Start AI Overlay"
             setOnClickListener {
-                val activeKeys = keyInputs.map { it.text.toString().trim() }.filter { it.length > 12 }
-                if (activeKeys.isEmpty()) {
+                val k1 = keyInput1.text.toString().trim()
+                val k2 = keyInput2.text.toString().trim()
+                val k3 = keyInput3.text.toString().trim()
+                val k4 = keyInput4.text.toString().trim()
+
+                if (k1.isEmpty() && k2.isEmpty() && k3.isEmpty() && k4.isEmpty()) {
                     Toast.makeText(context, "Paste at least 1 API key!", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
 
-                val editor = prefs.edit()
-                for (i in 1..8) {
-                    editor.putString("SAFE_KEY_$i", keyInputs[i - 1].text.toString().trim())
-                }
-                editor.putInt("OVERLAY_OPACITY", opacitySeekBar.progress)
-                editor.apply()
+                prefs.edit()
+                    .putString("SAFE_KEY_1", k1)
+                    .putString("SAFE_KEY_2", k2)
+                    .putString("SAFE_KEY_3", k3)
+                    .putString("SAFE_KEY_4", k4)
+                    .putInt("OVERLAY_OPACITY", opacitySeekBar.progress)
+                    .apply()
 
                 if (!Settings.canDrawOverlays(this@MainActivity)) {
                     val intent = Intent(
@@ -146,7 +147,10 @@ class MainActivity : AppCompatActivity() {
         val clearBtn = Button(this).apply {
             text = "Clear All Keys"
             setOnClickListener {
-                for (box in keyInputs) box.setText("")
+                keyInput1.setText("")
+                keyInput2.setText("")
+                keyInput3.setText("")
+                keyInput4.setText("")
                 prefs.edit().clear().apply()
                 Toast.makeText(context, "All keys cleared", Toast.LENGTH_SHORT).show()
             }
@@ -160,6 +164,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        layout.addView(title)
+        layout.addView(subtitle)
+        layout.addView(opacityLabel)
+        layout.addView(opacitySeekBar)
+        layout.addView(keyInput1)
+        layout.addView(keyInput2)
+        layout.addView(keyInput3)
+        layout.addView(keyInput4)
         layout.addView(startBtn)
         layout.addView(clearBtn)
         layout.addView(stopBtn)
@@ -174,7 +186,7 @@ class MainActivity : AppCompatActivity() {
             setHintTextColor(Color.GRAY)
             setText(savedVal)
             setSingleLine(true)
-            setPadding(24, 22, 24, 22)
+            setPadding(24, 28, 24, 28)
         }
     }
 }
