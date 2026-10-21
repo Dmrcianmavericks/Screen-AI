@@ -47,8 +47,6 @@ class OverlayService : Service() {
     private var latestBitmap: Bitmap? = null
 
     private var apiKeys: List<String> = emptyList()
-    private var overlayOpacityPercent: Int = 65
-
     // Strictly steps by 2: Scan 1 -> [0, 1] (Key 1 & 2), Scan 2 -> [2, 3] (Key 3 & 4), Scan 3 -> [0, 1] (Key 1 & 2)
     private val pairStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
@@ -81,8 +79,6 @@ class OverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-
-        overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 65).coerceIn(0, 100)
 
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
         apiKeys = rawKeys.split(",", "\n", " ")
@@ -206,7 +202,7 @@ class OverlayService : Service() {
         }
 
         val bgDrawable = GradientDrawable().apply {
-            setColor(Color.TRANSPARENT)
+            setColor(Color.parseColor("#E6000000"))
             cornerRadius = 36f
         }
 
@@ -215,7 +211,6 @@ class OverlayService : Service() {
             background = bgDrawable
             setPadding(18, 10, 22, 10)
             gravity = Gravity.CENTER_VERTICAL
-            alpha = overlayOpacityPercent / 100f
         }
 
         val scanButton = Button(this).apply {
@@ -229,7 +224,6 @@ class OverlayService : Service() {
 
         answerText = TextView(this).apply {
             text = "Ready (${apiKeys.size} keys)"
-            setBackgroundColor(Color.TRANSPARENT)
             setTextColor(Color.parseColor("#00FF88"))
             textSize = 14f
             setPadding(20, 0, 20, 0)
