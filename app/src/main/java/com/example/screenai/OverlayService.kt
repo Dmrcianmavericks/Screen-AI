@@ -47,6 +47,7 @@ class OverlayService : Service() {
     private var latestBitmap: Bitmap? = null
 
     private var apiKeys: List<String> = emptyList()
+    private var overlayOpacityPercent: Int = 80
     // Strictly steps by 2: Scan 1 -> [0, 1] (Key 1 & 2), Scan 2 -> [2, 3] (Key 3 & 4), Scan 3 -> [0, 1] (Key 1 & 2)
     private val pairStepCounter = AtomicInteger(0)
     private val geminiModelCache = ConcurrentHashMap<String, String>()
@@ -79,6 +80,8 @@ class OverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        overlayOpacityPercent = intent.getIntExtra("OPACITY_PERCENT", 80).coerceIn(0, 100)
 
         val rawKeys = intent.getStringExtra("API_KEY") ?: ""
         apiKeys = rawKeys.split(",", "\n", " ")
@@ -114,20 +117,20 @@ class OverlayService : Service() {
     }
 
     private fun startForegroundServiceNotification() {
-        val channelId = "ScreenAIChannel"
+        val channelId = "QuizSolverAIChannel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Screen AI", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(channelId, "Quiz Solver AI", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("Screen AI Active")
+                .setContentTitle("Quiz Solver AI Active")
                 .setContentText("Simultaneous Pair Mode: 1/2 <-> 3/4")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
             @Suppress("DEPRECATION")
-            Notification.Builder(this).setContentTitle("Screen AI Active").build()
+            Notification.Builder(this).setContentTitle("Quiz Solver AI Active").build()
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -202,7 +205,7 @@ class OverlayService : Service() {
         }
 
         val bgDrawable = GradientDrawable().apply {
-            setColor(Color.parseColor("#E6000000"))
+            setColor(Color.TRANSPARENT)
             cornerRadius = 36f
         }
 
@@ -211,6 +214,7 @@ class OverlayService : Service() {
             background = bgDrawable
             setPadding(18, 10, 22, 10)
             gravity = Gravity.CENTER_VERTICAL
+            alpha = overlayOpacityPercent / 100f
         }
 
         val scanButton = Button(this).apply {
