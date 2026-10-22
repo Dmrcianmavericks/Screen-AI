@@ -104,7 +104,7 @@ class OverlayService : Service() {
         setupScreenReader()
         setupFloatingOverlay()
 
-        // Pre-discover the best unlocked Gemini model for each key in the background on startup ONLY
+        // Pre-discover the fastest unlocked Flash-Lite model for each key in the background on startup ONLY
         for (k in apiKeys) {
             if (!k.startsWith("gsk_")) {
                 networkPool.execute {
@@ -117,20 +117,20 @@ class OverlayService : Service() {
     }
 
     private fun startForegroundServiceNotification() {
-        val channelId = "QuizSolverAIChannel"
+        val channelId = "QuizTurboLiteChannel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Quiz Solver AI", NotificationManager.IMPORTANCE_LOW)
+            val channel = NotificationChannel(channelId, "Quiz Turbo Lite", NotificationManager.IMPORTANCE_LOW)
             getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, channelId)
-                .setContentTitle("Quiz Solver AI Active")
-                .setContentText("Simultaneous Pair Mode: 1/2 <-> 3/4")
+                .setContentTitle("Quiz Turbo Lite Active")
+                .setContentText("Flash-Lite Instant Pair: 1/2 <-> 3/4")
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .build()
         } else {
             @Suppress("DEPRECATION")
-            Notification.Builder(this).setContentTitle("Quiz Solver AI Active").build()
+            Notification.Builder(this).setContentTitle("Quiz Turbo Lite Active").build()
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -142,8 +142,9 @@ class OverlayService : Service() {
 
     private fun setupScreenReader() {
         val metrics = resources.displayMetrics
-        val width = (metrics.widthPixels * 0.60).toInt()
-        val height = (metrics.heightPixels * 0.60).toInt()
+        // 0.54 scale reduces image size for instant sub-second uploads
+        val width = (metrics.widthPixels * 0.54).toInt()
+        val height = (metrics.heightPixels * 0.54).toInt()
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
@@ -181,7 +182,7 @@ class OverlayService : Service() {
         }, bgHandler)
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "ScreenAI", width, height, density,
+            "QuizTurboLite", width, height, density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, bgHandler
         )
@@ -227,7 +228,7 @@ class OverlayService : Service() {
         }
 
         answerText = TextView(this).apply {
-            text = "Ready (${apiKeys.size} keys)"
+            text = "Lite (${apiKeys.size} keys)"
             setTextColor(Color.parseColor("#00FF88"))
             textSize = 14f
             setPadding(20, 0, 20, 0)
@@ -317,7 +318,7 @@ class OverlayService : Service() {
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 62, outputStream)
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 54, outputStream)
         return Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -333,10 +334,6 @@ class OverlayService : Service() {
             return if (!singleRes.startsWith("ERR:")) singleRes else "Err (${singleRes.removePrefix("ERR:")})"
         }
 
-        // Steps by 2 on every scan:
-        // Click 1 -> offset 0 -> Key 1 & Key 2
-        // Click 2 -> offset 2 -> Key 3 & Key 4
-        // Click 3 -> offset 4 -> Key 1 & Key 2
         val offset = pairStepCounter.getAndAdd(2)
         val keyA = apiKeys[offset % total]
         val keyB = apiKeys[(offset + 1) % total]
@@ -415,7 +412,7 @@ class OverlayService : Service() {
                 doOutput = true
             }
 
-            val prompt = "Check carefully if the question asks for SYNONYM, ANTONYM, Grammar, or Math. Solve it and reply ONLY with the correct option letter and exact word/number (example: 'B) precise'). Max 4 words."
+            val prompt = "Reply ONLY with the correct option letter and exact word/number (example: 'B) precise'). Max 4 words."
 
             val contentArr = JSONArray().apply {
                 put(JSONObject().apply {
@@ -486,26 +483,30 @@ class OverlayService : Service() {
                 if (methods.contains("generateContent")) unlocked.add(name)
             }
 
+            // Strictly prioritizes Flash-Lite models at the very top for instant responses!
             val preferred = listOf(
+                "gemini-2.5-flash-lite",
+                "gemini-3.5-flash-lite",
+                "gemini-2.0-flash-lite",
                 "gemini-2.5-flash",
                 "gemini-3.6-flash",
-                "gemini-3.8-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-3.5-flash-lite"
+                "gemini-3.8-flash"
             )
             for (p in preferred) {
                 if (unlocked.contains(p)) return p
             }
-            unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
+            unlocked.firstOrNull { it.contains("lite") && !it.contains("tts") && !it.contains("image") }
+                ?: unlocked.firstOrNull { it.contains("flash") && !it.contains("tts") && !it.contains("image") }
         } catch (e: Exception) {
             null
         }
     }
 
-    // Never blocks on GET /models during a live quiz scan!
+    // Defaults directly to gemini-2.5-flash-lite with thinking disabled for pure speed!
     private fun callGeminiFast(key: String, base64Image: String): String {
-        val model = geminiModelCache[key] ?: "gemini-2.5-flash"
-        val allowThinking = !noThinkingModels.contains(model)
+        val model = geminiModelCache[key] ?: "gemini-2.5-flash-lite"
+        // Lite models have thinking OFF by default when thinkingConfig is omitted (includeThinking = false)
+        val allowThinking = !model.contains("lite") && !noThinkingModels.contains(model)
 
         var res = sendGeminiHttp(key, model, base64Image, includeThinking = allowThinking)
 
@@ -513,7 +514,11 @@ class OverlayService : Service() {
             noThinkingModels.add(model)
             res = sendGeminiHttp(key, model, base64Image, includeThinking = false)
         } else if (res == "ERR:404") {
-            val nextModel = if (model == "gemini-2.5-flash") "gemini-3.5-flash-lite" else "gemini-2.5-flash"
+            val nextModel = when (model) {
+                "gemini-2.5-flash-lite" -> "gemini-3.5-flash-lite"
+                "gemini-3.5-flash-lite" -> "gemini-2.5-flash"
+                else -> "gemini-2.5-flash-lite"
+            }
             geminiModelCache[key] = nextModel
             res = sendGeminiHttp(key, nextModel, base64Image, includeThinking = false)
         }
@@ -534,7 +539,7 @@ class OverlayService : Service() {
                 doOutput = true
             }
 
-            val prompt = "Pay strict attention to whether the question asks for SYNONYM, ANTONYM, Grammar, or Math calculation. Double-check the options (A/B/C/D) and output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
+            val prompt = "Read the question and options (A/B/C/D). Output ONLY the correct option letter and exact answer (example: 'B) precise'). Max 4 words."
 
             val inlineData = JSONObject().apply {
                 put("mimeType", "image/jpeg")
@@ -547,9 +552,9 @@ class OverlayService : Service() {
             val contents = JSONArray().put(JSONObject().put("parts", parts))
 
             val genConfig = JSONObject().apply {
-                put("maxOutputTokens", 120)
+                put("maxOutputTokens", 60)
                 if (includeThinking) {
-                    put("thinkingConfig", JSONObject().put("thinkingBudget", 64))
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", 32))
                 }
             }
 
