@@ -55,7 +55,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val prefs = getSharedPreferences("ScreenAIPrefs", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("QuizTurboLitePrefs", Context.MODE_PRIVATE)
 
         val scrollView = ScrollView(this).apply {
             setBackgroundColor(Color.WHITE)
@@ -68,14 +68,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Quiz Solver AI (Gemini + Groq Engine)"
+            text = "Quiz Turbo Lite (Instant Flash-Lite)"
             textSize = 20f
             setTextColor(Color.BLACK)
             setPadding(0, 0, 0, 14)
         }
 
         val subtitle = TextView(this).apply {
-            text = "Supports Gemini (AQ. / AIza) AND Groq (gsk_) keys in any box! Mix or match up to 4 keys. Never paste keys on GitHub."
+            text = "Runs strictly on Gemini Flash-Lite models with zero thinking overhead for instant sub-second responses."
             textSize = 13f
             setTextColor(Color.DKGRAY)
             setPadding(0, 0, 0, 28)
@@ -109,7 +109,7 @@ class MainActivity : AppCompatActivity() {
         keyInput4 = createKeyBox("Key 4 (AQ. / AIza / gsk_)", prefs.getString("SAFE_KEY_4", "") ?: "")
 
         val startBtn = Button(this).apply {
-            text = "Start AI Overlay"
+            text = "Start Lite Overlay"
             setOnClickListener {
                 val k1 = keyInput1.text.toString().trim()
                 val k2 = keyInput2.text.toString().trim()
